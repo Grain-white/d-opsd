@@ -72,3 +72,31 @@ This evaluation saves the generations. Second, replace the generation directory 
 cd d-opsd-code/eval
 python parse_and_get_acc.py
 ```
+
+## Answer prompt vs. answer clamp
+
+This fork adds information-matched answer-conditioned teachers for LLaDA:
+
+- `answer_prompt`: the verified answer from a correct on-policy rollout is appended to the teacher-only prompt.
+- `answer_clamp`: the same answer tokens are fixed at their natural rollout positions in the teacher completion.
+- `answer_clamp_future`: answer clamp plus fixed IGPO-style chunks from the same correct rollout.
+- `self_future`: the original d-OPSD teacher.
+
+The answer span comes from the same verifier path used for correctness. Ambiguous character-to-token mappings are rejected. Prompt and clamp use the same pass@8 rollout and only states in which the full answer span is still masked; privileged tokens never enter the student input or loss mask.
+
+Create the project-local compatibility environment and run tests without modifying an existing environment:
+
+```bash
+bash scripts/setup_isolated_env.sh
+PYTHONNOUSERSITE=1 .venv-dopsd-py312/bin/python tests/test_teacher_conditioning.py
+PYTHONNOUSERSITE=1 .venv-dopsd-py312/bin/python tests/import_trainer.py
+```
+
+Submit matched runs only to an allowed partition:
+
+```bash
+bash scripts/submit_prompt_vs_clamp.sh a01 50 42
+# or: bash scripts/submit_prompt_vs_clamp.sh h01 50 42
+```
+
+`MODEL_PATH`, `DOPSD_PYTHON`, `MAX_STEPS`, and `SEED` can be passed through `sbatch --export`. Checkpoints are written below `outputs/checkpoints`; logs and human-readable conditioning samples are written below `logs` and the corresponding run directory.

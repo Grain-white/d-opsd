@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import random
+from dataclasses import dataclass, asdict
 
 
 '''
@@ -61,9 +62,28 @@ def add_gumbel_noise(logits, temperature, dtype):
     gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
+@dataclass(frozen=True)
+class AnswerVerification:
+    parsed_answer: object
+    is_correct: bool
+    char_span: tuple[int, int] | None
+    answer_text: str | None
+    source: str | None
+    token_span: tuple[int, int] | None = None
+    span_status: str = "unmapped"
+
+    def to_dict(self):
+        return asdict(self)
+
+
 def get_all_parsed_answer(generation, answer, dataset):
+    result = get_all_parsed_answer_with_metadata(generation, answer, dataset)
+    return result.parsed_answer, result.is_correct
+
+
+def get_all_parsed_answer_with_metadata(generation, answer, dataset):
     if dataset == "gsm8k":
-        parsed_answer = get_parsed_answer(generation, answer) 
+        parsed_answer, char_span, answer_text, source = get_parsed_answer_with_span(generation)
         try:
             is_correct = parsed_answer is not None and parsed_answer == float(answer)
         except ValueError:
@@ -73,6 +93,7 @@ def get_all_parsed_answer(generation, answer, dataset):
             )
     elif dataset == "math":
         parsed_answer = get_parsed_answer_math(generation, answer)
+        char_span, answer_text, source = get_math_answer_span(generation)
         real_answer = None
         try:
             real_answer = remove_boxed(last_boxed_only_string(answer))
@@ -87,25 +108,54 @@ def get_all_parsed_answer(generation, answer, dataset):
         if parsed_answer is not None:
             is_correct = is_equiv(parsed_answer, real_answer)
         # main_print(f'real_answer is: {real_answer}')    
-    return parsed_answer, is_correct
+    else:
+        raise ValueError(f"Answer-span metadata is not implemented for dataset={dataset!r}")
+    return AnswerVerification(
+        parsed_answer=parsed_answer,
+        is_correct=bool(is_correct),
+        char_span=char_span,
+        answer_text=answer_text,
+        source=source,
+    )
 
 def get_parsed_answer(raw_generation, ground_truth):
+    return get_parsed_answer_with_span(raw_generation)[0]
+
+
+def get_parsed_answer_with_span(raw_generation):
     parsed_answer = None
-    boxed_matches = re.findall(r"\\boxed{(.*?)}", raw_generation)
+    char_span = None
+    answer_text = None
+    source = None
+    boxed_matches = list(re.finditer(r"\\boxed{(.*?)}", raw_generation, re.DOTALL))
 
     if boxed_matches:
-        for boxed_content in boxed_matches:
+        for boxed_match in boxed_matches:
+            boxed_content = boxed_match.group(1)
             # boxed_content = boxed_content.strip()
             boxed_content = boxed_content.strip().replace(",", "") 
             if boxed_content and boxed_content != "..." and not re.match(r"^\.+$", boxed_content):
                 try:
                     parsed_answer = float(boxed_content)
+                    raw_content = boxed_match.group(1)
+                    left_trim = len(raw_content) - len(raw_content.lstrip())
+                    right_trim = len(raw_content.rstrip())
+                    char_span = (boxed_match.start(1) + left_trim, boxed_match.start(1) + right_trim)
+                    answer_text = raw_generation[char_span[0]:char_span[1]]
+                    source = "boxed"
                     break
                 except ValueError:
-                    numbers = re.findall(r"-?\d+\.?\d*", boxed_content)
+                    numbers = list(re.finditer(r"-?\d[\d,]*(?:\.\d+)?", boxed_match.group(1)))
                     if numbers:
                         try:
-                            parsed_answer = float(numbers[0])
+                            number_match = numbers[0]
+                            answer_text = number_match.group(0)
+                            parsed_answer = float(answer_text.replace(",", ""))
+                            char_span = (
+                                boxed_match.start(1) + number_match.start(),
+                                boxed_match.start(1) + number_match.end(),
+                            )
+                            source = "boxed"
                             break
                         except ValueError:
                             pass
@@ -116,14 +166,26 @@ def get_parsed_answer(raw_generation, ground_truth):
             if answer_text:
                 try:
                     parsed_answer = float(answer_text)
+                    left_trim = len(answer_match.group(1)) - len(answer_match.group(1).lstrip())
+                    right_trim = len(answer_match.group(1).rstrip())
+                    char_span = (answer_match.start(1) + left_trim, answer_match.start(1) + right_trim)
+                    answer_text = raw_generation[char_span[0]:char_span[1]]
+                    source = "answer_tag"
                 except ValueError:
-                    numbers = re.findall(r"-?\d+\.?\d*", answer_text)
+                    numbers = list(re.finditer(r"-?\d[\d,]*(?:\.\d+)?", answer_match.group(1)))
                     if numbers:
                         try:
-                            parsed_answer = float(numbers[-1])
+                            number_match = numbers[-1]
+                            answer_text = number_match.group(0)
+                            parsed_answer = float(answer_text.replace(",", ""))
+                            char_span = (
+                                answer_match.start(1) + number_match.start(),
+                                answer_match.start(1) + number_match.end(),
+                            )
+                            source = "answer_tag"
                         except ValueError:
                             pass
-    return parsed_answer
+    return parsed_answer, char_span, answer_text, source
 
 def fix_fracs(string):
     substrs = string.split("\\frac")
@@ -336,6 +398,38 @@ def get_parsed_answer_math(raw_generation, ground_truth):
             parsed_answer = answer_match.group(1).strip()
 
     return parsed_answer
+
+
+def get_math_answer_span(raw_generation):
+    """Locate the exact answer content selected by the existing MATH verifier."""
+    boxed_start = max(raw_generation.rfind("\\boxed"), raw_generation.rfind("\\fbox"))
+    if boxed_start >= 0:
+        open_brace = raw_generation.find("{", boxed_start)
+        if open_brace >= 0:
+            depth = 0
+            for index in range(open_brace, len(raw_generation)):
+                if raw_generation[index] == "{":
+                    depth += 1
+                elif raw_generation[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        start, end = open_brace + 1, index
+                        while start < end and raw_generation[start].isspace():
+                            start += 1
+                        while end > start and raw_generation[end - 1].isspace():
+                            end -= 1
+                        return (start, end), raw_generation[start:end], "boxed"
+
+    answer_match = re.search(r"<answer>(.*?)</answer>", raw_generation, re.DOTALL)
+    if answer_match:
+        start, end = answer_match.span(1)
+        while start < end and raw_generation[start].isspace():
+            start += 1
+        while end > start and raw_generation[end - 1].isspace():
+            end -= 1
+        if start < end:
+            return (start, end), raw_generation[start:end], "answer_tag"
+    return None, None, None
 
 def get_parsed_answer_sudoku(raw_generation, ground_truth, question):
     puzzle_str = ""

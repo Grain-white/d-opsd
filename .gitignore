@@ -1,0 +1,6 @@
+.venv-dopsd*/
+outputs/
+checkpoints/
+logs/
+__pycache__/
+*.pyc

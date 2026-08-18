@@ -182,6 +182,28 @@ class dOPSDConfig(TrainingArguments):
         }
     )
 
+    teacher_conditioning: str = field(
+        default="self_future",
+        metadata={
+            "help": "Teacher construction: self_future, answer_prompt, answer_clamp, or answer_clamp_future."
+        },
+    )
+
+    rollout_filter: str = field(
+        default="correct_only",
+        metadata={"help": "Training rollout filter: correct_only or all."},
+    )
+
+    fixed_teacher_tokens_remask: bool = field(
+        default=False,
+        metadata={"help": "Experimental ablation that permits privileged teacher tokens to be remasked."},
+    )
+
+    future_hint_ratio_min: float = field(default=0.2)
+    future_hint_ratio_max: float = field(default=0.6)
+    future_hint_chunk_min: int = field(default=5)
+    future_hint_chunk_max: int = field(default=10)
+
     fixed_teacher: bool = field(
         default=True,
         metadata={

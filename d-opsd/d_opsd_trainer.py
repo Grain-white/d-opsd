@@ -5,6 +5,10 @@ import numpy as np
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback, Trainer
 from datasets import Dataset, IterableDataset
 import warnings
+import random
+import time
+import json
+from pathlib import Path
 import torch.nn.functional as F
 from trl.trainer.grpo_config import GRPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
@@ -22,7 +26,21 @@ from trl.trainer.utils import (
     selective_log_softmax,
 )
 
-from utils import main_print, generate, get_all_parsed_answer, get_parsed_answer_sudoku, get_parsed_answer_countdown
+from utils import (
+    main_print,
+    generate,
+    get_all_parsed_answer,
+    get_all_parsed_answer_with_metadata,
+    get_parsed_answer_sudoku,
+    get_parsed_answer_countdown,
+)
+from teacher_conditioning import (
+    build_answer_prompt,
+    fully_masked_rows,
+    map_char_span_to_token_span,
+    sample_future_hint_positions,
+    split_bounds,
+)
 
 
 if is_peft_available():
@@ -83,6 +101,13 @@ class dOPSDTrainer(GRPOTrainer):
         self.passk = args.passk
         self.passk_temperature = args.passk_temperature
         self.teacher_retain_ratio = args.teacher_retain_ratio
+        self.teacher_conditioning = args.teacher_conditioning
+        self.rollout_filter = args.rollout_filter
+        self.fixed_teacher_tokens_remask = args.fixed_teacher_tokens_remask
+        self.future_hint_ratio_min = args.future_hint_ratio_min
+        self.future_hint_ratio_max = args.future_hint_ratio_max
+        self.future_hint_chunk_min = args.future_hint_chunk_min
+        self.future_hint_chunk_max = args.future_hint_chunk_max
         self.fixed_teacher = args.fixed_teacher
         self.top_k_loss = args.top_k_loss
         self.jsd_token_clip = args.jsd_token_clip
@@ -90,7 +115,28 @@ class dOPSDTrainer(GRPOTrainer):
         self.diff_student_mask = args.diff_student_mask
         self.dataset_name = args.dataset
         self.sudoku_threshold = args.sudoku_threshold
+        valid_conditioning = {"self_future", "answer_prompt", "answer_clamp", "answer_clamp_future"}
         if self.add_ref:
+            warnings.warn(
+                "add_ref is a legacy full-solution baseline and is not information-matched. "
+                "It is kept for compatibility only.",
+                stacklevel=2,
+            )
+            self.teacher_conditioning = "reference_prompt"
+        elif self.teacher_conditioning not in valid_conditioning:
+            raise ValueError(f"teacher_conditioning must be one of {sorted(valid_conditioning)}")
+        if self.rollout_filter not in {"correct_only", "all"}:
+            raise ValueError("rollout_filter must be 'correct_only' or 'all'")
+        if self.fixed_teacher_tokens_remask and self.teacher_conditioning.startswith("answer_"):
+            raise NotImplementedError(
+                "Stochastic remasking is intentionally excluded from the primary experiment. "
+                "Set fixed_teacher_tokens_remask=false."
+            )
+        if not (0 <= self.future_hint_ratio_min <= self.future_hint_ratio_max <= 1):
+            raise ValueError("Future hint ratios must satisfy 0 <= min <= max <= 1")
+        if not (1 <= self.future_hint_chunk_min <= self.future_hint_chunk_max):
+            raise ValueError("Future hint chunk sizes must satisfy 1 <= min <= max")
+        if self.teacher_conditioning in {"answer_prompt", "reference_prompt"}:
             self.teacher_max_prompt_length = args.teacher_max_prompt_length
         if args.max_grad_norm is not None:
             main_print(f'max_grad is {args.max_grad_norm}')
@@ -101,6 +147,8 @@ class dOPSDTrainer(GRPOTrainer):
         main_print(f"PassK (number of reasoning trajectories): {self.passk}")
         main_print(f"PassK temperature: {self.passk_temperature}")
         main_print(f"Teacher retain ratio: {self.teacher_retain_ratio}")
+        main_print(f"Teacher conditioning: {self.teacher_conditioning}")
+        main_print(f"Rollout filter: {self.rollout_filter}")
         main_print(f"Fixed teacher: {self.fixed_teacher}")
         main_print(f"Top-k for loss computation: {self.top_k_loss}")
         main_print(f"JSD token clip value: {self.jsd_token_clip}")
@@ -117,6 +165,16 @@ class dOPSDTrainer(GRPOTrainer):
             main_print(f'cfg>0, Wrong')
             raise NotImplementedError("CFG is not implemented for dOPSDTrainer yet")
         return logits
+
+    @staticmethod
+    def topk_kendall_tau(student_logits, teacher_logits, top_k=20):
+        """Kendall tau of student ranks over the teacher's top-k candidates."""
+        k = min(top_k, teacher_logits.shape[-1])
+        teacher_indices = torch.topk(teacher_logits, k=k, dim=-1).indices
+        student_scores = torch.gather(student_logits, dim=-1, index=teacher_indices)
+        upper = torch.triu_indices(k, k, offset=1, device=student_logits.device)
+        pair_differences = student_scores[..., upper[0]] - student_scores[..., upper[1]]
+        return pair_differences.sign().float().mean()
     
     def generalized_jsd_loss(
         self,
@@ -214,33 +272,27 @@ class dOPSDTrainer(GRPOTrainer):
     
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        '''
-        inputs {
-            "prompt_length": prompt_length,
-            "teacher_prompt_length": teacher_prompt_length,
-            "trajectory": trajectory.cpu(),
-            "teacher_trajectory": teacher_trajectory.cpu(),
-            "steps": steps, 
-            "gen_length": gen_length,
-            "block_length": block_length,
-            "is_correct": is_correct,
-            }
-        '''
-        
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        prompt_length, teacher_prompt_length, steps, gen_length, block_length = inputs["prompt_length"], inputs["teacher_prompt_length"], inputs["steps"], inputs["gen_length"], inputs["block_length"]
+        prompt_length = inputs["prompt_length"]
+        teacher_prompt_length = inputs["teacher_prompt_length"]
+        block_length = inputs["block_length"]
         is_correct = inputs["is_correct"]
-        bsz_per_step = (inputs["trajectory"].shape[0] - 1) // self.batch_divide # to prevent OOM
-        if bsz_per_step == 0:
-            raise ValueError(f"Batch size per step is zero. Check if the batch_divide {self.batch_divide} is too large for the current batch size {inputs['trajectory'].shape[0] - 1}.")
-        start_pos = ((self._step - 1) % self.batch_divide) * bsz_per_step
-        end_pos = start_pos + bsz_per_step
-        student_input = inputs["trajectory"][start_pos:end_pos].to(model.device)
-        student_output = inputs["trajectory"][start_pos + 1:end_pos + 1].to(model.device)
-        teacher_input = inputs["teacher_trajectory"][start_pos:end_pos].to(model.device)
-        
+        pair_count = inputs["student_inputs"].shape[0]
+        microstep = (self._step - 1) % self.batch_divide
+        start_pos, end_pos = split_bounds(pair_count, self.batch_divide, microstep)
+        if start_pos == end_pos:
+            raise ValueError(
+                f"Only {pair_count} eligible state pairs for batch_divide={self.batch_divide}. "
+                "Reduce batch_divide or increase diffusion states."
+            )
+        student_input = inputs["student_inputs"][start_pos:end_pos].to(model.device)
+        student_output = inputs["student_outputs"][start_pos:end_pos].to(model.device)
+        teacher_input = inputs["teacher_inputs"][start_pos:end_pos].to(model.device)
+        privileged_mask = inputs["privileged_mask"][start_pos:end_pos].to(model.device)
+
         # teacher forward
+        teacher_started = time.perf_counter()
         if self.fixed_teacher and is_peft_model(model):
             with torch.no_grad(), self.accelerator.unwrap_model(model).disable_adapter():
                 teacher_logits = self.get_logits(model, teacher_input, None, self.args.cfg_scale, self.args.mask_id)
@@ -248,23 +300,30 @@ class dOPSDTrainer(GRPOTrainer):
             with torch.no_grad():
                 teacher_logits = self.get_logits(model, teacher_input, None, self.args.cfg_scale, self.args.mask_id)
         teacher_logits = teacher_logits.detach()
-        
-        if (not self.add_ref) and self.diff_student_mask:
-            diff_mask = student_input != student_output  # [bsz_per_step, seq_length]. This identifies the computation positions.
+        teacher_seconds = time.perf_counter() - teacher_started
+
+        prompt_delta = teacher_prompt_length - prompt_length
+        selected_rows = []
+        teacher_positions = []
+        student_positions = []
+        if self.diff_student_mask:
+            if prompt_delta != 0:
+                raise ValueError("diff_student_mask is not supported with a length-changing teacher prompt")
+            changed = student_input != student_output
+            for row in range(changed.shape[0]):
+                positions = torch.where(changed[row] & ~privileged_mask[row])[0][:2]
+                for position in positions.tolist():
+                    selected_rows.append(row)
+                    teacher_positions.append(position)
+                    student_positions.append(position)
         else:
             mask_id = self.args.mask_id
             seq_length = teacher_input.size(1)
-            # Refer to the "selection from the teacher distribution" in the paper: Use teacher confidence to pick 2 masked positions in the current block.
-            teacher_confidence = teacher_logits.max(dim=-1).values  # [bsz_per_step, seq_length]
-            diff_mask = torch.zeros_like(teacher_input, dtype=torch.bool)
-
+            teacher_confidence = teacher_logits.max(dim=-1).values
             for i in range(teacher_input.size(0)):
-                masked_positions = torch.where(teacher_input[i] == mask_id)[0]
+                masked_positions = torch.where((teacher_input[i] == mask_id) & ~privileged_mask[i])[0]
                 if masked_positions.numel() == 0:
-                    raise ValueError(
-                        f"No mask_id found in teacher_input at row {i}. Cannot build diff_mask."
-                    )
-
+                    continue
                 first_mask_pos = masked_positions[0]
                 relative_pos = first_mask_pos - teacher_prompt_length
                 if relative_pos < 0:
@@ -275,55 +334,56 @@ class dOPSDTrainer(GRPOTrainer):
                 block_idx = relative_pos // block_length
                 block_start = teacher_prompt_length + block_idx * block_length
                 block_end = min(block_start + block_length, seq_length)
-
                 block_positions = torch.arange(block_start, block_end, device=teacher_input.device)
-                block_masked_positions = block_positions[teacher_input[i, block_positions] == mask_id]
-
-                if block_masked_positions.numel() < 2:
-                    raise ValueError(
-                        f"Expected at least 2 mask_id positions in block [{block_start}, {block_end}) for row {i}, "
-                        f"but found {block_masked_positions.numel()}."
-                    )
-
+                block_masked_positions = block_positions[
+                    (teacher_input[i, block_positions] == mask_id)
+                    & ~privileged_mask[i, block_positions]
+                ]
+                if block_masked_positions.numel() == 0:
+                    continue
                 block_confidence = teacher_confidence[i, block_masked_positions]
-                top2_relative = torch.topk(block_confidence, k=2, dim=0).indices
-                top2_positions = block_masked_positions[top2_relative]
-                diff_mask[i, top2_positions] = True
-        diff_counts = diff_mask.sum(dim=1)
-        if not torch.all(diff_counts == 2): 
-            # Here we fix it as 2 because all our trainings are based on decoding 2 toekns at each step. You can adjust it to yours.
-            bad_rows = torch.nonzero(diff_counts != 2, as_tuple=True)[0]
-            raise ValueError(
-                f"Each student_input/student_output pair must differ at exactly 2 positions, "
-                f"but got counts={diff_counts.tolist()}, bad_rows={bad_rows.tolist()}."
-                f" "
-            )
-        teacher_idx_selection = torch.stack([torch.where(diff_mask[i])[0] for i in range(diff_mask.size(0))], dim=0) # [bsz_per_step, 2]
-        if self.add_ref:
-            assert teacher_prompt_length != prompt_length
-            idx_selection = teacher_idx_selection - (teacher_prompt_length - prompt_length)
-        else:
-            assert teacher_prompt_length == prompt_length
-            idx_selection = teacher_idx_selection
+                count = min(2, block_masked_positions.numel())
+                chosen = block_masked_positions[torch.topk(block_confidence, k=count).indices]
+                for teacher_position in chosen.tolist():
+                    student_position = teacher_position - prompt_delta
+                    if not prompt_length <= student_position < student_input.shape[1]:
+                        raise AssertionError("Teacher/student target alignment escaped the completion")
+                    selected_rows.append(i)
+                    teacher_positions.append(teacher_position)
+                    student_positions.append(student_position)
+        if not selected_rows:
+            raise ValueError("No non-privileged masked targets remain in this microbatch")
+        row_index = torch.tensor(selected_rows, device=model.device, dtype=torch.long)
+        teacher_index = torch.tensor(teacher_positions, device=model.device, dtype=torch.long)
+        student_index = torch.tensor(student_positions, device=model.device, dtype=torch.long)
+        assert not privileged_mask[row_index, teacher_index].any(), "Privileged tokens entered the loss"
         if self.debug1:
             main_print(f'step is:{self._step}')
             main_print(f'global step is: {self.state.global_step}')
             main_print(f'start_pos: {start_pos}, end_pos: {end_pos}')
             main_print(f'trajectory shape: {student_input.shape}')
-            main_print(f'idx_selection shape: {idx_selection.shape}')
-            main_print(f'idx_selection[5] is: {idx_selection[5]}')
-            
+            main_print(f'selected target count: {len(selected_rows)}')
+
         # student forward
+        student_started = time.perf_counter()
         student_logits = self.get_logits(model, student_input, None, self.args.cfg_scale, self.args.mask_id)
+        student_seconds = time.perf_counter() - student_started
         if self.debug1:
             main_print(f'Before logits cutting')
             main_print(f'student_logits shape: {student_logits.shape}')
             main_print(f'teacher_logits shape: {teacher_logits.shape}')
-
-        idx_selection_expanded = idx_selection.unsqueeze(-1).expand(-1, -1, student_logits.size(-1))
-        teacher_idx_selection_expanded = teacher_idx_selection.unsqueeze(-1).expand(-1, -1, teacher_logits.size(-1))
-        student_logits = torch.gather(student_logits, dim=1, index=idx_selection_expanded)
-        teacher_logits = torch.gather(teacher_logits, dim=1, index=teacher_idx_selection_expanded)
+        student_logits = student_logits[row_index, student_index].unsqueeze(1)
+        teacher_logits = teacher_logits[row_index, teacher_index].unsqueeze(1)
+        kendall_tau = self.topk_kendall_tau(student_logits, teacher_logits, self.top_k_loss or 20)
+        completion_positions = student_index - prompt_length
+        final_completion_ids = inputs["final_completion_ids"].to(model.device)
+        target_ids = final_completion_ids[completion_positions]
+        student_target_prob = torch.gather(
+            F.softmax(student_logits[:, 0].float(), dim=-1), 1, target_ids[:, None]
+        ).mean()
+        teacher_target_prob = torch.gather(
+            F.softmax(teacher_logits[:, 0].float(), dim=-1), 1, target_ids[:, None]
+        ).mean()
         if self.debug1:
             main_print(f'After logits cutting')
             main_print(f'student_logits shape: {student_logits.shape}')
@@ -338,12 +398,24 @@ class dOPSDTrainer(GRPOTrainer):
             )   
         if self.debug1:
             main_print(f'After generalized_jsd_loss: loss={loss.item():.6f}, clip_ratio={clip_ratio.item():.6f}, top_k_overlap_shape={tuple(top_k_overlap.shape)}')
-        assert top_k_overlap.shape == (student_logits.size(0), idx_selection.size(1))
+        assert top_k_overlap.shape == (student_logits.size(0), 1)
         
         mode = "eval" if self.control.should_evaluate else "train"
         self._metrics[mode]["loss"].append(self.accelerator.gather_for_metrics(loss).mean().item())
         self._metrics[mode]["clip_ratio"].append(
             self.accelerator.gather_for_metrics(clip_ratio).mean().item()
+        )
+        self._metrics[mode]["teacher_forward_seconds"].append(teacher_seconds)
+        self._metrics[mode]["student_forward_seconds"].append(student_seconds)
+        self._metrics[mode]["distillation_targets"].append(float(len(selected_rows)))
+        self._metrics[mode]["kendall_tau_topk"].append(
+            self.accelerator.gather_for_metrics(kendall_tau).mean().item()
+        )
+        self._metrics[mode]["student_correct_token_probability"].append(
+            self.accelerator.gather_for_metrics(student_target_prob).mean().item()
+        )
+        self._metrics[mode]["teacher_correct_token_probability"].append(
+            self.accelerator.gather_for_metrics(teacher_target_prob).mean().item()
         )
         # top_k_overlap has shape [local_batch, local_seq_len], which may vary across ranks.
         # Reduce locally to a scalar first to avoid distributed gather shape mismatch / deadlock.
@@ -353,20 +425,18 @@ class dOPSDTrainer(GRPOTrainer):
         if self.debug1:
             main_print(f'After metrics gather: top_k_overlap_value={top_k_overlap_value:.6f}')
 
-        del student_logits, teacher_logits, diff_mask, student_input, student_output, teacher_input
+        del student_logits, teacher_logits, student_input, student_output, teacher_input, privileged_mask
         torch.cuda.empty_cache()
-        
-        # Refer to the "Computeonly on Correct Generations" in the paper. For ablations, just replace followings with "return loss".
+
         if self.dataset_name == "sudoku":
-            if is_correct >= self.sudoku_threshold:
-                return loss
-            else:
-                return loss * 0.0
-        # return loss
-        elif is_correct or self.add_ref:
-            return loss
+            accepted = is_correct >= self.sudoku_threshold
         else:
+            accepted = bool(is_correct)
+        if self.teacher_conditioning.startswith("answer_") and not inputs.get("conditioning_available", False):
             return loss * 0.0
+        if self.rollout_filter == "all" or accepted or self.teacher_conditioning == "reference_prompt":
+            return loss
+        return loss * 0.0
 
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
@@ -385,7 +455,7 @@ class dOPSDTrainer(GRPOTrainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
-    def _generate_and_score_completions(
+    def _generate_and_score_completions_legacy(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -643,7 +713,6 @@ class dOPSDTrainer(GRPOTrainer):
                         completions_to_log,
                         rewards_to_log,
                         self._step,
-                        teacher_prompts_to_log if self.add_ref else None,
                     )
 
         return {
@@ -655,4 +724,273 @@ class dOPSDTrainer(GRPOTrainer):
             "gen_length": gen_length,
             "block_length": block_length,
             "is_correct": is_correct,
+        }
+
+    def _generate_and_score_completions(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """Generate one shared rollout and construct the configured teacher."""
+        if self.teacher_conditioning in {"self_future", "reference_prompt"}:
+            legacy = self._generate_and_score_completions_legacy(inputs)
+            trajectory = legacy.pop("trajectory")
+            teacher_trajectory = legacy.pop("teacher_trajectory")
+            legacy.update(
+                student_inputs=trajectory[:-1],
+                student_outputs=trajectory[1:],
+                teacher_inputs=teacher_trajectory[:-1],
+                privileged_mask=torch.zeros_like(teacher_trajectory[:-1], dtype=torch.bool),
+                conditioning_available=True,
+                eligible_state_ratio=1.0,
+                answer_token_span=None,
+                span_status="not_required",
+                final_completion_ids=trajectory[-1, legacy["prompt_length"]:].clone(),
+            )
+            return legacy
+
+        if len(inputs) != 1:
+            raise ValueError("Answer-conditioned rollout currently requires per-device batch size 1")
+        device = self.accelerator.device
+        mode = "eval" if self.control.should_evaluate else "train"
+        generation_started = time.perf_counter()
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        prompt_inputs = Trainer._prepare_inputs(self, prompt_inputs)
+        prompt_ids = prompt_inputs["input_ids"]
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length:]
+        prompt_length = prompt_ids.size(1)
+        gen_length = self.args.max_completion_length
+        block_length = self.args.block_length
+        steps = self.args.diffusion_steps
+
+        def run_once(unwrapped_model, temperature):
+            return generate(
+                model=unwrapped_model,
+                prompt=prompt_ids,
+                steps=steps,
+                gen_length=gen_length,
+                block_length=block_length,
+                temperature=temperature,
+                cfg_scale=self.args.cfg_scale,
+                remasking=self.args.remasking,
+                mask_id=self.args.mask_id,
+                debug1=self.debug1,
+                fp16=self.args.fp16,
+            )
+
+        verification = None
+        answer_token_span = None
+        span_status = "not_checked"
+        verifier_correct = False
+        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+            with torch.no_grad():
+                for attempt in range(1, self.passk + 1):
+                    temperature = (self.args.temperature or 0.0) if attempt == 1 else self.passk_temperature
+                    batch_prompt_completion_ids, batch_trajectory = run_once(unwrapped_model, temperature)
+                    completion_ids = batch_prompt_completion_ids[0, prompt_length:].tolist()
+                    completion_text = self.processing_class.decode(completion_ids, skip_special_tokens=False)
+                    verification = get_all_parsed_answer_with_metadata(
+                        completion_text, inputs[0]["answer"], self.dataset_name
+                    )
+                    verifier_correct = verification.is_correct
+                    answer_token_span = None
+                    if verification.is_correct and verification.char_span is not None:
+                        answer_token_span, span_status = map_char_span_to_token_span(
+                            self.processing_class,
+                            completion_ids,
+                            completion_text,
+                            verification.char_span,
+                            verification.answer_text,
+                        )
+                    elif verification.is_correct:
+                        span_status = "verifier_span_missing"
+                    if verification.is_correct and answer_token_span is not None:
+                        break
+
+        conditioning_available = bool(verifier_correct and answer_token_span is not None)
+        is_correct = conditioning_available
+        trajectory = torch.cat(batch_trajectory, dim=0)
+        final_sequence = batch_prompt_completion_ids[0]
+        student_inputs = trajectory[:-1]
+        student_outputs = trajectory[1:]
+        pair_count = student_inputs.shape[0]
+        teacher_prompt_length = prompt_length
+        teacher_inputs = student_inputs.clone()
+        privileged_mask = torch.zeros_like(teacher_inputs, dtype=torch.bool)
+        eligible_rows = torch.arange(pair_count, device=student_inputs.device)
+        answer_absolute_span = None
+        teacher_prompts_text = None
+
+        if conditioning_available:
+            answer_start, answer_end = answer_token_span
+            answer_absolute_span = (prompt_length + answer_start, prompt_length + answer_end)
+            eligible = fully_masked_rows(student_inputs, answer_absolute_span, self.args.mask_id)
+            eligible_rows = torch.where(eligible)[0]
+            if self.teacher_conditioning == "answer_prompt":
+                teacher_example = dict(inputs[0])
+                teacher_example["prompt"] = build_answer_prompt(
+                    inputs[0]["prompt"], verification.answer_text
+                )
+                teacher_prompts_text = [
+                    maybe_apply_chat_template(teacher_example, self.processing_class)["prompt"]
+                ]
+                teacher_prompt_inputs = self.processing_class(
+                    text=teacher_prompts_text,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    add_special_tokens=False,
+                )
+                teacher_prompt_inputs = Trainer._prepare_inputs(self, teacher_prompt_inputs)
+                teacher_prompt_ids = teacher_prompt_inputs["input_ids"]
+                if self.teacher_max_prompt_length is not None:
+                    teacher_prompt_ids = teacher_prompt_ids[:, -self.teacher_max_prompt_length:]
+                teacher_prompt_length = teacher_prompt_ids.size(1)
+                teacher_completion = student_inputs[:, prompt_length:]
+                teacher_inputs = torch.cat(
+                    [teacher_prompt_ids.expand(pair_count, -1), teacher_completion], dim=1
+                )
+                privileged_mask = torch.zeros_like(teacher_inputs, dtype=torch.bool)
+                assert torch.all(
+                    teacher_completion[eligible_rows, answer_start:answer_end] == self.args.mask_id
+                ), "Answer prompt accidentally revealed completion answer tokens"
+            else:
+                absolute_start, absolute_end = answer_absolute_span
+                answer_tokens = final_sequence[absolute_start:absolute_end]
+                teacher_inputs[:, absolute_start:absolute_end] = answer_tokens
+                privileged_mask[:, absolute_start:absolute_end] = True
+                assert torch.equal(
+                    teacher_inputs[:, absolute_start:absolute_end],
+                    answer_tokens.expand(pair_count, -1),
+                ), "Clamp answer differs from verified rollout"
+
+                if self.teacher_conditioning == "answer_clamp_future":
+                    pure_completion = final_sequence[prompt_length:]
+                    eos_id = self.processing_class.eos_token_id
+                    eos_positions = torch.where(pure_completion == eos_id)[0] if eos_id is not None else []
+                    pure_end = prompt_length + (
+                        int(eos_positions[0]) if len(eos_positions) else pure_completion.numel()
+                    )
+                    reasoning_positions = [
+                        position
+                        for position in range(prompt_length, pure_end)
+                        if not absolute_start <= position < absolute_end
+                    ]
+                    rng = random.Random(self.args.seed + int(self.state.global_step))
+                    hint_positions = sample_future_hint_positions(
+                        reasoning_positions,
+                        self.future_hint_ratio_min,
+                        self.future_hint_ratio_max,
+                        self.future_hint_chunk_min,
+                        self.future_hint_chunk_max,
+                        rng,
+                    )
+                    for row in range(pair_count):
+                        current_targets = student_inputs[row] != student_outputs[row]
+                        for position in hint_positions:
+                            if student_inputs[row, position] == self.args.mask_id and not current_targets[position]:
+                                teacher_inputs[row, position] = final_sequence[position]
+                                privileged_mask[row, position] = True
+
+        eligible_state_ratio = float(eligible_rows.numel() / max(pair_count, 1))
+        if conditioning_available and eligible_rows.numel() < self.batch_divide:
+            conditioning_available = False
+            is_correct = False
+            span_status = "insufficient_eligible_states"
+            eligible_rows = torch.arange(pair_count, device=student_inputs.device)
+            teacher_inputs = student_inputs.clone()
+            privileged_mask = torch.zeros_like(teacher_inputs, dtype=torch.bool)
+            teacher_prompt_length = prompt_length
+
+        student_inputs = student_inputs[eligible_rows]
+        student_outputs = student_outputs[eligible_rows]
+        teacher_inputs = teacher_inputs[eligible_rows]
+        privileged_mask = privileged_mask[eligible_rows]
+        if self.teacher_conditioning.startswith("answer_clamp") and conditioning_available:
+            assert torch.all(
+                student_inputs[:, answer_absolute_span[0]:answer_absolute_span[1]] == self.args.mask_id
+            ), "Student received answer clamp tokens"
+
+        completion_ids_tensor = batch_prompt_completion_ids[0, prompt_length:]
+        eos_id = self.processing_class.eos_token_id
+        eos_positions = torch.where(completion_ids_tensor == eos_id)[0] if eos_id is not None else []
+        completion_length = int(eos_positions[0]) if len(eos_positions) else completion_ids_tensor.numel()
+        generation_seconds = time.perf_counter() - generation_started
+        metrics = {
+            "completion_length": float(completion_length),
+            "iter_num": float(attempt),
+            "passk_success": float(conditioning_available),
+            "verifier_accuracy": float(verifier_correct),
+            "span_locatable": float(answer_token_span is not None),
+            "eligible_state_ratio": eligible_state_ratio,
+            "generation_seconds": generation_seconds,
+            "rollout_tokens_per_second": float(gen_length * attempt / max(generation_seconds, 1e-6)),
+            "answer_source_boxed": float(verification is not None and verification.source == "boxed"),
+            "answer_source_answer_tag": float(
+                verification is not None and verification.source == "answer_tag"
+            ),
+        }
+        for name, value in metrics.items():
+            gathered = self.accelerator.gather_for_metrics(
+                torch.tensor(value, device=device, dtype=torch.float32)
+            ).mean().item()
+            self._metrics[mode][name].append(gathered)
+        completions_text = [completion_text]
+        if self.log_completions and self.state.global_step % self.args.completion_logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = gather_object([float(verifier_correct)])
+            if self.accelerator.is_main_process:
+                print_prompt_completions_sample(
+                    prompts_to_log,
+                    completions_to_log,
+                    rewards_to_log,
+                    self._step,
+                )
+                artifact_path = Path(self.args.output_dir) / "conditioning_samples.jsonl"
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                teacher_completion_text = self.processing_class.decode(
+                    teacher_inputs[0, teacher_prompt_length:].tolist(), skip_special_tokens=False
+                )
+                with artifact_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "global_step": self.state.global_step,
+                        "teacher_conditioning": self.teacher_conditioning,
+                        "prompt": prompts_text[0],
+                        "teacher_prompt": teacher_prompts_text[0] if teacher_prompts_text else prompts_text[0],
+                        "completion": completion_text,
+                        "teacher_completion_state": teacher_completion_text,
+                        "parsed_answer": str(verification.parsed_answer) if verification else None,
+                        "answer_text": verification.answer_text if verification else None,
+                        "answer_source": verification.source if verification else None,
+                        "answer_token_span": answer_token_span,
+                        "span_status": span_status,
+                        "conditioning_available": conditioning_available,
+                        "eligible_state_ratio": eligible_state_ratio,
+                    }, ensure_ascii=False) + "\n")
+
+        return {
+            "prompt_length": prompt_length,
+            "teacher_prompt_length": teacher_prompt_length,
+            "student_inputs": student_inputs.cpu(),
+            "student_outputs": student_outputs.cpu(),
+            "teacher_inputs": teacher_inputs.cpu(),
+            "privileged_mask": privileged_mask.cpu(),
+            "steps": steps,
+            "gen_length": gen_length,
+            "block_length": block_length,
+            "is_correct": is_correct,
+            "conditioning_available": conditioning_available,
+            "eligible_state_ratio": eligible_state_ratio,
+            "answer_token_span": answer_token_span,
+            "answer_source": verification.source if verification else None,
+            "span_status": span_status,
+            "rollout_attempts": attempt,
+            "final_completion_ids": final_sequence[prompt_length:].cpu(),
         }

@@ -59,6 +59,12 @@ from .utils import (
     selective_log_softmax,
 )
 
+# This repository does not use vLLM generation.  Some shared cluster environments
+# contain a newer, incompatible vLLM that TRL would otherwise import merely because
+# the package is discoverable.  Disable the optional backend before its conditional
+# import; the normal Transformers generation path remains unchanged.
+is_vllm_available = lambda: False
+
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model

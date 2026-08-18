@@ -105,7 +105,7 @@ def main(opsd_config, model_config):
 
     if opsd_config.save_steps % opsd_config.num_iterations != 0:
         warnings.warn(
-            f"save_steps ({opsd_config.save_steps}) is not divisible by num_iterations ({opsd_config.num_iterations}). If resuming training from a checkpoint, you might need to manually specify the checkpoint where the training step is divisible by {grpo_config.num_iterations}."
+            f"save_steps ({opsd_config.save_steps}) is not divisible by num_iterations ({opsd_config.num_iterations}). If resuming training from a checkpoint, you might need to manually specify a checkpoint whose step is divisible by {opsd_config.num_iterations}."
         )
 
     trainer.train()

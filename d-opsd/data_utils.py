@@ -71,7 +71,14 @@ def extract_reasoning_gsm8k(generated_text):
     return None
 
 def get_gsm8k_questions(split="train", add_ref=False) -> Dataset:
-    data = load_dataset("openai/gsm8k", "main")[split]
+    local_dir = os.environ.get("GSM8K_LOCAL_DIR")
+    if local_dir:
+        parquet_path = os.path.join(local_dir, "main", f"{split}-00000-of-00001.parquet")
+        if not os.path.isfile(parquet_path):
+            raise FileNotFoundError(f"Missing local GSM8K split: {parquet_path}")
+        data = load_dataset("parquet", data_files={split: parquet_path}, split=split)
+    else:
+        data = load_dataset("openai/gsm8k", "main")[split]
     if add_ref: # AR-style adding a reference solution to the prompt
         return data.map(
             lambda x: {
