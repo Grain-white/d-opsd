@@ -11,6 +11,7 @@ import re
 from datasets import load_dataset
 from parsers import Parser, is_equiv
 import torch.distributed as dist
+import os
 
 GSM_SYSTEM_PROMPT = """You are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{}. 
 Respond in the following format:
@@ -54,6 +55,21 @@ class GSM8KDataset(torch.utils.data.Dataset):
         return len(self.subsample)
 
     def load_test_dataset(self):
+        local_dir = os.environ.get("GSM8K_LOCAL_DIR")
+        if local_dir:
+            parquet_path = os.path.join(
+                local_dir, "main", f"{self.split}-00000-of-00001.parquet"
+            )
+            if not os.path.isfile(parquet_path):
+                raise FileNotFoundError(
+                    f"GSM8K_LOCAL_DIR is set but split is missing: {parquet_path}"
+                )
+            self.dataset = load_dataset(
+                "parquet", data_files={self.split: parquet_path}, split=self.split
+            )
+            if self.split != "test":
+                self.dataset = self.dataset.select(range(min(1000, len(self.dataset))))
+            return
         if self.split == "test":
             self.dataset = load_dataset("gsm8k", "main", split="test") # .select(range(500))
         else:

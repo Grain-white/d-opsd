@@ -25,6 +25,7 @@ MAX_STEPS=${MAX_STEPS:-50}
 PASS_K=${PASS_K:-8}
 RUN_NAME=${RUN_NAME:-${CONDITION}-seed${SEED}-steps${MAX_STEPS}}
 NUM_PROCESSES=${NUM_PROCESSES:-4}
+SAVE_STEPS=${SAVE_STEPS:-25}
 
 case "$CONDITION" in
   self_future|answer_prompt|answer_clamp|answer_clamp_future) ;;
@@ -66,7 +67,7 @@ cd "$REPO_ROOT/d-opsd"
   --num_iterations 8 \
   --batch_divide 8 \
   --fixed_teacher \
-  --save_steps 25 \
+  --save_steps "$SAVE_STEPS" \
   --run_name "$RUN_NAME" \
   --output_dir "$REPO_ROOT/outputs/checkpoints/$RUN_NAME" \
   --report_to none

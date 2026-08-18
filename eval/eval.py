@@ -391,12 +391,20 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--num_answer_per_question", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=-1,
+        help="Evaluate at most this many examples; -1 keeps the dataset default.",
+    )
     args = parser.parse_args()
 
     init_seed(args.seed)
 
     main_print(f"Using diffusion steps: {args.diffusion_steps}, block length: {args.block_length} for gen length: {args.gen_length}")
     num_evals = {"gsm": -1, "math": -1, "countdown": 256, "sudoku": 256}
+    if args.max_examples > 0:
+        num_evals[args.dataset] = args.max_examples
 
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
         local_rank
