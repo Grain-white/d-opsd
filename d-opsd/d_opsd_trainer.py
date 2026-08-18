@@ -99,6 +99,7 @@ class dOPSDTrainer(GRPOTrainer):
         self.batch_divide = args.batch_divide
         self.debug1 = args.debug1 # cnannot replace with debug, there is already one "debug" attribute existed.
         self.passk = args.passk
+        self.eval_passk = args.eval_passk
         self.passk_temperature = args.passk_temperature
         self.teacher_retain_ratio = args.teacher_retain_ratio
         self.teacher_conditioning = args.teacher_conditioning
@@ -797,7 +798,8 @@ class dOPSDTrainer(GRPOTrainer):
         verifier_correct = False
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             with torch.no_grad():
-                for attempt in range(1, self.passk + 1):
+                active_passk = self.eval_passk if mode == "eval" else self.passk
+                for attempt in range(1, active_passk + 1):
                     temperature = (self.args.temperature or 0.0) if attempt == 1 else self.passk_temperature
                     batch_prompt_completion_ids, batch_trajectory = run_once(unwrapped_model, temperature)
                     completion_ids = batch_prompt_completion_ids[0, prompt_length:].tolist()

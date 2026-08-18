@@ -14,6 +14,7 @@ peft_task_type: CAUSAL_LM
 
 # dOPSDConfig
 passk: 8
+eval_passk: 1
 passk_temperature: 0.9
 teacher_retain_ratio: 0.25
 teacher_conditioning: self_future
@@ -23,6 +24,7 @@ future_hint_ratio_min: 0.2
 future_hint_ratio_max: 0.6
 future_hint_chunk_min: 5
 future_hint_chunk_max: 10
+validation_samples: 32
 batch_divide: 8
 top_k_loss: 20
 beta: 0
@@ -77,6 +79,9 @@ output_dir: /checkpoints/gsm_sft_bs12  # <-- Replace with desired output directo
 save_steps: 25
 save_strategy: steps
 save_total_limit: 500 
+eval_strategy: steps
+eval_steps: 10
+eval_on_start: true
 
 # Diffusion and GRPO-specific (this is retained from the GRPO baseline diffu-GRPO)
 max_completion_length: 256

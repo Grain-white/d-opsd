@@ -1,9 +1,12 @@
+import os
+
 import torch
 import wandb
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from trl import TrlParser, ModelConfig
 from peft import LoraConfig
 import warnings
+from swanlab.integration.transformers import SwanLabCallback
 
 # Custom imports
 from d_opsd_trainer import dOPSDTrainer
@@ -35,6 +38,7 @@ def main(opsd_config, model_config):
     # Load dataset based on configuration
     if opsd_config.dataset == "gsm8k":
         dataset = get_gsm8k_questions(split="train", add_ref=opsd_config.add_ref)
+        eval_dataset = get_gsm8k_questions(split="test", add_ref=False)
         reward_functions = [
             xmlcount_reward_func,
             soft_format_reward_func,
@@ -44,18 +48,25 @@ def main(opsd_config, model_config):
         ]
     elif opsd_config.dataset == "countdown":
         dataset = get_countdown_questions("train")
+        eval_dataset = None
         reward_functions = [countdown_reward_func]
     elif opsd_config.dataset == "sudoku":
         dataset = get_sudoku_questions()
+        eval_dataset = None
         reward_functions = [sudoku_reward_func]
     elif opsd_config.dataset == "math":
         dataset = get_math_questions("train", add_ref=opsd_config.add_ref)
+        eval_dataset = None
         reward_functions = [
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
         ]
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=opsd_config.seed)
+    if eval_dataset is not None:
+        eval_dataset = eval_dataset.shuffle(seed=opsd_config.seed).select(
+            range(min(opsd_config.validation_samples, len(eval_dataset)))
+        )
 
     # Split dataset if needed
     if opsd_config.dataset in ["countdown", "sudoku"]:
@@ -95,12 +106,32 @@ def main(opsd_config, model_config):
         lora_dropout=model_config.lora_dropout,
     )
     # Initialize and run trainer
+    callbacks = []
+    swanlab_mode = os.environ.get("SWANLAB_MODE", "cloud")
+    if swanlab_mode != "disabled":
+        callbacks.append(
+            SwanLabCallback(
+                project=os.environ.get("DOPSD_SWANLAB_PROJECT", "d-opsd-prompt-vs-clamp"),
+                workspace=os.environ.get("DOPSD_SWANLAB_WORKSPACE") or None,
+                experiment_name=opsd_config.run_name,
+                description=(
+                    f"teacher_conditioning={opsd_config.teacher_conditioning}; "
+                    f"seed={opsd_config.seed}; pass_k={opsd_config.passk}"
+                ),
+                log_dir=os.path.join(opsd_config.output_dir, "swanlab"),
+                mode=swanlab_mode,
+                tags=[opsd_config.teacher_conditioning, opsd_config.dataset, f"seed-{opsd_config.seed}"],
+            )
+        )
+
     trainer = dOPSDTrainer(
         args=opsd_config,
         model=model,
         peft_config=peft_config,
         reward_funcs=reward_functions,
         train_dataset=train_set,
+        eval_dataset=eval_dataset,
+        callbacks=callbacks,
     )
 
     if opsd_config.save_steps % opsd_config.num_iterations != 0:

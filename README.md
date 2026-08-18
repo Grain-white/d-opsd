@@ -100,3 +100,10 @@ bash scripts/submit_prompt_vs_clamp.sh a01 50 42
 ```
 
 `MODEL_PATH`, `DOPSD_PYTHON`, `MAX_STEPS`, and `SEED` can be passed through `sbatch --export`. Checkpoints are written below `outputs/checkpoints`; logs and human-readable conditioning samples are written below `logs` and the corresponding run directory.
+
+The main comparison uses seed 42, `pass_k=8` for finding correct on-policy
+training trajectories, and `eval_passk=1` on a fixed 32-example held-out GSM8K
+subset. Validation runs before training and every 10 optimizer steps; checkpoints
+are saved every 50 steps. An explicit `SwanLabCallback` records the runs under
+project `d-opsd-prompt-vs-clamp`. Use `SWANLAB_MODE=cloud` after `swanlab login`,
+or use `offline` and later run the printed `swanlab sync ...` command.

@@ -168,6 +168,11 @@ class dOPSDConfig(TrainingArguments):
         }
     )
 
+    eval_passk: int = field(
+        default=1,
+        metadata={"help": "Number of rollout attempts per held-out validation example."},
+    )
+
     passk_temperature: float = field(
         default=1.0,
         metadata={
@@ -203,6 +208,11 @@ class dOPSDConfig(TrainingArguments):
     future_hint_ratio_max: float = field(default=0.6)
     future_hint_chunk_min: int = field(default=5)
     future_hint_chunk_max: int = field(default=10)
+
+    validation_samples: int = field(
+        default=32,
+        metadata={"help": "Size of the fixed held-out validation subset used during training."},
+    )
 
     fixed_teacher: bool = field(
         default=True,
