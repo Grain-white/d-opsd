@@ -27,7 +27,7 @@ future_hint_chunk_max: 10
 validation_samples: 32
 batch_divide: 8
 top_k_loss: 20
-beta: 0
+beta: 1
 fixed_teacher: False
 jsd_token_clip: 0.05
 debug1: False

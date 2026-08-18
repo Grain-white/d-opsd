@@ -30,6 +30,7 @@ SAVE_STEPS=${SAVE_STEPS:-50}
 EVAL_STEPS=${EVAL_STEPS:-10}
 VALIDATION_SAMPLES=${VALIDATION_SAMPLES:-32}
 EVAL_ON_START=${EVAL_ON_START:-true}
+BETA=${BETA:-1}
 
 case "$CONDITION" in
   self_future|answer_prompt|answer_clamp|answer_clamp_future) ;;
@@ -75,6 +76,7 @@ cd "$REPO_ROOT/d-opsd"
   --max_steps "$MAX_STEPS" \
   --num_iterations 8 \
   --batch_divide 8 \
+  --beta "$BETA" \
   --fixed_teacher \
   --save_steps "$SAVE_STEPS" \
   --eval_strategy steps \

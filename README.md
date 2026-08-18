@@ -107,3 +107,7 @@ subset. Validation runs before training and every 10 optimizer steps; checkpoint
 are saved every 50 steps. An explicit `SwanLabCallback` records the runs under
 project `d-opsd-prompt-vs-clamp`. Use `SWANLAB_MODE=cloud` after `swanlab login`,
 or use `offline` and later run the printed `swanlab sync ...` command.
+
+The remaining optimization settings follow `d-opsd/run/gsm/opsd.sh`, including
+`beta=1`, `batch_divide=num_iterations=8`, a fixed adapter-disabled teacher,
+teacher top-k 20, and token-level divergence clipping at 0.05.
