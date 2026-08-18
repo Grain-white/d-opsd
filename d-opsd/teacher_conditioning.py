@@ -14,14 +14,27 @@ from typing import Sequence
 import torch
 
 
+# Formal OPSD answer-only privileged block (RLCSD `opsd_format.build_teacher_messages`
+# with `privileged_text_mode=answer_only` / `TEACHER_PROMPT_TEMPLATE_ANSWER_ONLY`):
+# wrap the verified final answer as a "reference solution" and ask the teacher to
+# internalize the reasoning before producing its own solution.
+ANSWER_PROMPT_FRAMING = "Here is a reference solution to this problem:"
+ANSWER_PROMPT_TRANSITION = (
+    "\n\nAfter reading the reference solution above, make sure you understand "
+    "the reasoning behind each step.\n"
+)
 ANSWER_PROMPT_TEMPLATE = (
-    "\n\nPrivileged information for the teacher only: the known final answer is {answer}. "
-    "Use it to reason about the best continuation, but still produce the full solution."
+    "\n\n"
+    f"{ANSWER_PROMPT_FRAMING}\n"
+    "=== Reference Solution Begin ===\n"
+    "Correct final answer: {answer}\n"
+    "=== Reference Solution End ==="
+    f"{ANSWER_PROMPT_TRANSITION}"
 )
 
 
 def build_answer_prompt(messages, answer_text: str):
-    """Return a copy of a conversational prompt with answer-only information."""
+    """Return a copy of a conversational prompt with OPSD answer-only injection."""
     teacher_messages = copy.deepcopy(messages)
     if not teacher_messages or "content" not in teacher_messages[-1]:
         raise ValueError("Expected a non-empty conversational prompt")

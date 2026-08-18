@@ -77,7 +77,7 @@ python parse_and_get_acc.py
 
 This fork adds information-matched answer-conditioned teachers for LLaDA:
 
-- `answer_prompt`: the verified answer from a correct on-policy rollout is appended to the teacher-only prompt.
+- `answer_prompt`: the verified answer from a correct on-policy rollout is appended to the teacher-only prompt using formal OPSD answer-only injection (`=== Reference Solution ===` + `Correct final answer:` + transition).
 - `answer_clamp`: the same answer tokens are fixed at their natural rollout positions in the teacher completion.
 - `answer_clamp_future`: answer clamp plus fixed IGPO-style chunks from the same correct rollout.
 - `self_future`: the original d-OPSD teacher.

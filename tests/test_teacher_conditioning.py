@@ -81,8 +81,14 @@ def test_prompt_is_copied_and_contains_answer_only():
     messages = [{"role": "user", "content": "Solve 1+1"}]
     teacher = build_answer_prompt(messages, "2")
     assert messages[0]["content"] == "Solve 1+1"
-    assert "known final answer is 2" in teacher[0]["content"]
-    assert "reference solution" not in teacher[0]["content"].lower()
+    content = teacher[0]["content"]
+    # Formal OPSD answer_only injection (RLCSD).
+    assert "Here is a reference solution to this problem:" in content
+    assert "=== Reference Solution Begin ===" in content
+    assert "Correct final answer: 2" in content
+    assert "=== Reference Solution End ===" in content
+    assert "After reading the reference solution above" in content
+    assert "Privileged information for the teacher only" not in content
 
 
 def test_clamp_eligibility_and_balanced_split():
