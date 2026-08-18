@@ -226,9 +226,10 @@ class dOPSDTrainer(GRPOTrainer):
                 student_logits.shape[:-1], dtype=student_logits.dtype, device=student_logits.device
             )
 
-        # Compute log probabilities for student and probabilities for teacher
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        # KL reductions are numerically fragile in bf16.  Compute the
+        # distributions in fp32 even when the model forward uses bf16.
+        student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits.float(), dim=-1)
 
         if beta == 0: # forward
             jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
@@ -250,7 +251,13 @@ class dOPSDTrainer(GRPOTrainer):
             # Compute the Generalized Jensen-Shannon Divergence
             jsd = beta * kl_teacher + (1 - beta) * kl_student
 
-        # Per-token clipping: cap each token's divergence value. This refers to the pointwise KL clipping in the paper.
+        # A distillation target is one sequence token, whose divergence is the
+        # sum over vocabulary entries.  Individual KL summands may be negative;
+        # clipping them before this sum can therefore make the total divergence
+        # negative.  Reduce vocabulary first, then apply token-level clipping.
+        jsd = jsd.sum(dim=-1).clamp_min(0.0)
+
+        # Per-token clipping: cap each selected sequence token's divergence.
         if token_clip is not None:
             clipped_mask = jsd > token_clip
             clip_ratio = clipped_mask.float().mean()
