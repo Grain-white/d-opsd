@@ -408,7 +408,7 @@ class dOPSDTrainer(GRPOTrainer):
             main_print(f'After generalized_jsd_loss: loss={loss.item():.6f}, clip_ratio={clip_ratio.item():.6f}, top_k_overlap_shape={tuple(top_k_overlap.shape)}')
         assert top_k_overlap.shape == (student_logits.size(0), 1)
         
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = "train" if self.model.training else "eval"
         self._metrics[mode]["loss"].append(self.accelerator.gather_for_metrics(loss).mean().item())
         self._metrics[mode]["clip_ratio"].append(
             self.accelerator.gather_for_metrics(clip_ratio).mean().item()
@@ -449,7 +449,7 @@ class dOPSDTrainer(GRPOTrainer):
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = "train" if self.model.training else "eval"
 
         if mode == "train":
             # Very important, due to the RepeatSampler from GPPOTrainer.
@@ -467,6 +467,8 @@ class dOPSDTrainer(GRPOTrainer):
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        active_passk = self.eval_passk if mode == "eval" else self.passk
 
         prompts_text = [
             maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs
@@ -531,6 +533,10 @@ class dOPSDTrainer(GRPOTrainer):
                         parsed_answer, is_correct = get_parsed_answer_countdown(completions_text[0], inputs[0]["numbers"], inputs[0]["target"])
                     else:
                         parsed_answer, is_correct = get_all_parsed_answer(completions_text[0], inputs[0]["answer"], self.dataset_name)
+                    if self.dataset_name == "sudoku":
+                        verifier_pass_at_1 = accuracy >= self.sudoku_threshold
+                    else:
+                        verifier_pass_at_1 = bool(is_correct)
                     if self.debug1:
                         main_print(f'input is:{inputs}')  
                         '''
@@ -555,7 +561,7 @@ class dOPSDTrainer(GRPOTrainer):
                     
                     # Refer to the "pass@k" in the paper: extend to more reasoning trajectories if needed.
                     iter_num = 1
-                    while (not self.add_ref) and iter_num < self.passk and (not is_correct or self.dataset_name == "sudoku"):
+                    while (not self.add_ref) and iter_num < active_passk and (not is_correct or self.dataset_name == "sudoku"):
                         iter_num = iter_num + 1
                         batch_prompt_completion_ids, batch_trajectory = generate(
                             model=unwrapped_model,
@@ -684,11 +690,27 @@ class dOPSDTrainer(GRPOTrainer):
         
 
         # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = "train" if self.model.training else "eval"
         completion_length = self.accelerator.gather_for_metrics(pure_gen_length).float().mean().item()
         self._metrics[mode]["completion_length"].append(completion_length)
         mean_is_correct = self.accelerator.gather_for_metrics(local_is_correct).mean().item()
         self._metrics[mode]["iter_num"].append(mean_is_correct)
+        if self.dataset_name != "sudoku":
+            verifier_metrics = {
+                "passk_success": float(bool(is_correct)),
+                # Back-compat with answer-conditioned validation metrics.
+                "verifier_accuracy": float(bool(is_correct)),
+                "verifier_pass_at_1": float(verifier_pass_at_1),
+            }
+            if active_passk >= 8:
+                verifier_metrics["verifier_pass_at_8"] = float(bool(is_correct))
+            elif active_passk != 1:
+                verifier_metrics[f"verifier_pass_at_{active_passk}"] = float(bool(is_correct))
+            for name, value in verifier_metrics.items():
+                gathered = self.accelerator.gather_for_metrics(
+                    torch.tensor(value, device=device, dtype=torch.float32)
+                ).mean().item()
+                self._metrics[mode][name].append(gathered)
         if self.dataset_name == "sudoku":
             if accuracy >= self.sudoku_threshold:
                 effective_num = 1
@@ -758,7 +780,7 @@ class dOPSDTrainer(GRPOTrainer):
         if len(inputs) != 1:
             raise ValueError("Answer-conditioned rollout currently requires per-device batch size 1")
         device = self.accelerator.device
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = "train" if self.model.training else "eval"
         generation_started = time.perf_counter()
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
