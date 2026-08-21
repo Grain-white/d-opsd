@@ -1,3 +1,4 @@
+import hashlib
 import torch
 from trl.trainer.grpo_trainer import GRPOTrainer
 from typing import Any, Callable, Optional, Union, Sized
@@ -158,6 +159,26 @@ class dOPSDTrainer(GRPOTrainer):
         main_print(f"Dataset name: {self.dataset_name}")
         main_print(f"Sudoku accuracy threshold: {self.sudoku_threshold}")
         main_print(f'gen_length: {self.args.max_completion_length}, block_length: {self.args.block_length}, diffusion_steps: {self.args.diffusion_steps}')
+
+    def _stable_input_seed(self, inputs, salt: int = 0) -> int:
+        """Condition-independent seed for a held-out example."""
+        example = inputs[0] if isinstance(inputs, list) and inputs else inputs
+        if isinstance(example, dict):
+            canonical_keys = ("question", "answer", "puzzle", "solution", "numbers", "target")
+            example = {key: example[key] for key in canonical_keys if key in example}
+        payload = json.dumps(example, sort_keys=True, ensure_ascii=False, default=str)
+        digest = int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
+        return (int(self.args.seed) + digest + int(salt)) % (2**31 - 1)
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        """Route metrics by the actual log payload, including eval-on-start."""
+        is_eval_log = any(key.startswith("eval_") for key in logs)
+        previous_should_evaluate = self.control.should_evaluate
+        self.control.should_evaluate = is_eval_log
+        try:
+            return super().log(logs, start_time)
+        finally:
+            self.control.should_evaluate = previous_should_evaluate
 
     def get_logits(self, model, batch, prompt_index, cfg_scale, mask_id):
         input = batch
@@ -460,7 +481,13 @@ class dOPSDTrainer(GRPOTrainer):
                 inputs = self._buffered_inputs[0]
             self._step += 1
         else:
-            inputs = self._generate_and_score_completions(inputs)
+            # Each held-out example gets the same rollout RNG under every
+            # conditioning method. Restore the training RNG after evaluation.
+            cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+            with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+                eval_seed = self._stable_input_seed(inputs, salt=17)
+                torch.manual_seed(eval_seed)
+                inputs = self._generate_and_score_completions(inputs)
         return inputs
 
     def _generate_and_score_completions_legacy(
@@ -496,6 +523,7 @@ class dOPSDTrainer(GRPOTrainer):
         temperature = self.args.temperature or 0.0
         cfg_scale = self.args.cfg_scale
 
+        generation_started = time.perf_counter()
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = 1 # we fix it here. It almost won't slow the training..
             with torch.no_grad():
@@ -607,6 +635,7 @@ class dOPSDTrainer(GRPOTrainer):
                     '''
             # The correct here is for pass@k. If correct, we only keep the first succesful trajectory; Otherwise we keep the last sampled trajectory.
             local_is_correct = torch.tensor(iter_num, device=device, dtype=torch.float32)
+        generation_seconds = time.perf_counter() - generation_started
 
         if self.dataset_name == "sudoku":
             accuracy = best_accuracy
@@ -675,7 +704,21 @@ class dOPSDTrainer(GRPOTrainer):
                 num_replace = int(num_candidates * self.teacher_retain_ratio)
                 if num_replace <= 0:
                     continue
-                selected_relative = torch.randperm(num_candidates, device=teacher_trajectory.device)[:num_replace]
+                # Teacher-only hint sampling must not perturb the global RNG used by
+                # subsequent student rollouts.  A stable per-example/per-step seed also
+                # makes the conditioning comparison reproducible across runs.
+                teacher_generator = torch.Generator(device=teacher_trajectory.device)
+                teacher_generator.manual_seed(
+                    self._stable_input_seed(
+                        inputs,
+                        salt=int(self.state.global_step) * 1_000_003 + step_idx + 29,
+                    )
+                )
+                selected_relative = torch.randperm(
+                    num_candidates,
+                    device=teacher_trajectory.device,
+                    generator=teacher_generator,
+                )[:num_replace]
                 selected_positions = candidate_positions[selected_relative]
                 teacher_trajectory[step_idx, selected_positions] = final_sequence[selected_positions]
         
@@ -697,10 +740,17 @@ class dOPSDTrainer(GRPOTrainer):
         self._metrics[mode]["iter_num"].append(mean_is_correct)
         if self.dataset_name != "sudoku":
             verifier_metrics = {
+                "rollout_attempts": float(iter_num),
                 "passk_success": float(bool(is_correct)),
                 # Back-compat with answer-conditioned validation metrics.
                 "verifier_accuracy": float(bool(is_correct)),
                 "verifier_pass_at_1": float(verifier_pass_at_1),
+                "conditioning_available": 1.0,
+                "eligible_state_ratio": 1.0,
+                "generation_seconds": generation_seconds,
+                "rollout_tokens_per_second": float(
+                    gen_length * iter_num / max(generation_seconds, 1e-6)
+                ),
             }
             if active_passk >= 8:
                 verifier_metrics["verifier_pass_at_8"] = float(bool(is_correct))
@@ -817,7 +867,8 @@ class dOPSDTrainer(GRPOTrainer):
         verification = None
         answer_token_span = None
         span_status = "not_checked"
-        verifier_correct = False
+        verifier_correct = False  # pass@k: True if any attempt is verifier-correct
+        verifier_pass_at_1 = False  # first-attempt (usually T=0) verifier correctness
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             with torch.no_grad():
                 active_passk = self.eval_passk if mode == "eval" else self.passk
@@ -829,7 +880,10 @@ class dOPSDTrainer(GRPOTrainer):
                     verification = get_all_parsed_answer_with_metadata(
                         completion_text, inputs[0]["answer"], self.dataset_name
                     )
-                    verifier_correct = verification.is_correct
+                    if verification.is_correct:
+                        verifier_correct = True
+                        if attempt == 1:
+                            verifier_pass_at_1 = True
                     answer_token_span = None
                     if verification.is_correct and verification.char_span is not None:
                         answer_token_span, span_status = map_char_span_to_token_span(
@@ -956,8 +1010,12 @@ class dOPSDTrainer(GRPOTrainer):
         metrics = {
             "completion_length": float(completion_length),
             "iter_num": float(attempt),
-            "passk_success": float(conditioning_available),
+            "rollout_attempts": float(attempt),
+            "passk_success": float(verifier_correct),
+            # Back-compat: verifier_accuracy == pass@{active_passk} (eval uses eval_passk).
             "verifier_accuracy": float(verifier_correct),
+            "verifier_pass_at_1": float(verifier_pass_at_1),
+            "conditioning_available": float(conditioning_available),
             "span_locatable": float(answer_token_span is not None),
             "eligible_state_ratio": eligible_state_ratio,
             "generation_seconds": generation_seconds,
@@ -967,6 +1025,10 @@ class dOPSDTrainer(GRPOTrainer):
                 verification is not None and verification.source == "answer_tag"
             ),
         }
+        if active_passk >= 8:
+            metrics["verifier_pass_at_8"] = float(verifier_correct)
+        elif active_passk != 1:
+            metrics[f"verifier_pass_at_{active_passk}"] = float(verifier_correct)
         for name, value in metrics.items():
             gathered = self.accelerator.gather_for_metrics(
                 torch.tensor(value, device=device, dtype=torch.float32)
