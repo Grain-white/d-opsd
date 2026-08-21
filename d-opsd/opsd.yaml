@@ -13,7 +13,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 # dOPSDConfig
-passk: 8
+passk: 1
 eval_passk: 1
 passk_temperature: 0.9
 teacher_retain_ratio: 0.25

@@ -56,7 +56,11 @@ def main(opsd_config, model_config):
         reward_functions = [sudoku_reward_func]
     elif opsd_config.dataset == "math":
         dataset = get_math_questions("train", add_ref=opsd_config.add_ref)
-        eval_dataset = None
+        # Prefer a dedicated test split when available; otherwise hold out from train.
+        try:
+            eval_dataset = get_math_questions("test", add_ref=False)
+        except (ValueError, KeyError, FileNotFoundError, OSError):
+            eval_dataset = None
         reward_functions = [
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
@@ -71,6 +75,10 @@ def main(opsd_config, model_config):
     # Split dataset if needed
     if opsd_config.dataset in ["countdown", "sudoku"]:
         train_set = dataset.select(range(0, len(dataset) - 500))  # Leave last 500 for evaluation
+    elif opsd_config.dataset == "math" and eval_dataset is None:
+        n_val = min(opsd_config.validation_samples, max(1, len(dataset) // 5))
+        eval_dataset = dataset.select(range(len(dataset) - n_val, len(dataset)))
+        train_set = dataset.select(range(0, len(dataset) - n_val))
     else:
         train_set = dataset
 
@@ -109,20 +117,25 @@ def main(opsd_config, model_config):
     callbacks = []
     swanlab_mode = os.environ.get("SWANLAB_MODE", "cloud")
     if swanlab_mode != "disabled":
-        callbacks.append(
-            SwanLabCallback(
-                project=os.environ.get("DOPSD_SWANLAB_PROJECT", "d-opsd-prompt-vs-clamp"),
-                workspace=os.environ.get("DOPSD_SWANLAB_WORKSPACE") or None,
-                experiment_name=opsd_config.run_name,
-                description=(
-                    f"teacher_conditioning={opsd_config.teacher_conditioning}; "
-                    f"seed={opsd_config.seed}; pass_k={opsd_config.passk}"
-                ),
-                log_dir=os.path.join(opsd_config.output_dir, "swanlab"),
-                mode=swanlab_mode,
-                tags=[opsd_config.teacher_conditioning, opsd_config.dataset, f"seed-{opsd_config.seed}"],
-            )
+        swanlab_callback = SwanLabCallback(
+            project=os.environ.get("DOPSD_SWANLAB_PROJECT", "d-opsd-prompt-vs-clamp"),
+            workspace=os.environ.get("DOPSD_SWANLAB_WORKSPACE") or None,
+            experiment_name=opsd_config.run_name,
+            description=(
+                f"teacher_conditioning={opsd_config.teacher_conditioning}; "
+                f"seed={opsd_config.seed}; pass_k={opsd_config.passk}"
+            ),
+            log_dir=os.path.join(opsd_config.output_dir, "swanlab"),
+            mode=swanlab_mode,
+            tags=[opsd_config.teacher_conditioning, opsd_config.dataset, f"seed-{opsd_config.seed}"],
         )
+        # SwanLabCallback drops unknown kwargs; inject resume id explicitly so
+        # SWANLAB_RUN_ID continues the same cloud experiment instead of creating a new one.
+        swanlab_run_id = os.environ.get("SWANLAB_RUN_ID")
+        if swanlab_run_id:
+            swanlab_callback._init_kwargs["id"] = swanlab_run_id
+            swanlab_callback._init_kwargs["resume"] = os.environ.get("SWANLAB_RESUME", "must")
+        callbacks.append(swanlab_callback)
 
     trainer = dOPSDTrainer(
         args=opsd_config,
@@ -139,7 +152,14 @@ def main(opsd_config, model_config):
             f"save_steps ({opsd_config.save_steps}) is not divisible by num_iterations ({opsd_config.num_iterations}). If resuming training from a checkpoint, you might need to manually specify a checkpoint whose step is divisible by {opsd_config.num_iterations}."
         )
 
-    trainer.train()
+    resume_from_checkpoint = opsd_config.resume_from_checkpoint
+    if isinstance(resume_from_checkpoint, str):
+        lowered = resume_from_checkpoint.strip().lower()
+        if lowered in {"", "false", "none", "null"}:
+            resume_from_checkpoint = False
+        elif lowered in {"true", "1", "yes"}:
+            resume_from_checkpoint = True
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 
 if __name__ == "__main__":

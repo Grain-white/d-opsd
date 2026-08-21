@@ -140,7 +140,20 @@ def get_sudoku_questions() -> Dataset:
     )
 
 def get_math_questions(split="train", add_ref=False) -> Dataset:
-    data = load_dataset("ankner/math-500",split=split)  # type: ignore
+    local_dir = os.environ.get("MATH_LOCAL_DIR")
+    if local_dir:
+        candidates = [
+            os.path.join(local_dir, "data", f"{split}-00000-of-00001.parquet"),
+            os.path.join(local_dir, f"{split}-00000-of-00001.parquet"),
+        ]
+        parquet_path = next((p for p in candidates if os.path.isfile(p)), None)
+        if parquet_path is None:
+            raise FileNotFoundError(
+                f"Missing local math-500 split '{split}' under {local_dir}; tried: {candidates}"
+            )
+        data = load_dataset("parquet", data_files={split: parquet_path}, split=split)
+    else:
+        data = load_dataset("ankner/math-500", split=split)  # type: ignore
     if add_ref: # AR-style adding a reference solution to the prompt
         data = data.map(
             lambda x: {  # type: ignore
