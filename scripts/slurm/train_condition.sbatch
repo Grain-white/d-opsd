@@ -101,8 +101,13 @@ mkdir -p "$REPO_ROOT/logs" "$REPO_ROOT/outputs" "$HF_DATASETS_CACHE" \
   "$HUGGINGFACE_HUB_CACHE" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 cd "$REPO_ROOT/d-opsd"
 
+ACCELERATE_CONFIG_FILE=accelerate.yaml
+if [[ "$EVAL_ONLY" == "true" ]]; then
+  ACCELERATE_CONFIG_FILE=accelerate_eval.yaml
+  NUM_PROCESSES=1
+fi
 "$PYTHON" -m accelerate.commands.launch \
-  --config_file accelerate.yaml \
+  --config_file "$ACCELERATE_CONFIG_FILE" \
   --num_processes "$NUM_PROCESSES" \
   --main_process_port $((12000 + SLURM_JOB_ID % 20000)) \
   d_opsd_train.py \
