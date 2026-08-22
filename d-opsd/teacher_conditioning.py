@@ -74,6 +74,38 @@ def select_group_rollout_pair(candidates):
     return donor_index, recipient_index
 
 
+def select_group_answer_donors(candidates):
+    """Return one donor index per rollout, or ``None`` without a correct donor.
+
+    Correct rollouts condition on themselves.  Every incorrect rollout uses the
+    first verifier-correct rollout in sampling order.  Requiring a locatable
+    answer span for the first correct donor gives prompt, clamp, and self-future
+    group variants identical group acceptance and answer-position geometry.
+    """
+    first_correct = next(
+        (
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate["is_correct"]
+            and candidate.get("answer_text")
+            and candidate.get("token_span") is not None
+        ),
+        None,
+    )
+    if first_correct is None:
+        return None
+    return [
+        index
+        if (
+            candidate["is_correct"]
+            and candidate.get("answer_text")
+            and candidate.get("token_span") is not None
+        )
+        else first_correct
+        for index, candidate in enumerate(candidates)
+    ]
+
+
 def _find_subsequence(sequence: Sequence[int], needle: Sequence[int]):
     if not needle or len(needle) > len(sequence):
         return []

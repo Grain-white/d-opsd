@@ -15,6 +15,7 @@ from teacher_conditioning import (  # noqa: E402
     fully_masked_rows,
     map_char_span_to_token_span,
     sample_future_hint_positions,
+    select_group_answer_donors,
     select_group_rollout_pair,
     split_bounds,
 )
@@ -132,6 +133,24 @@ def test_group_pair_keeps_the_earliest_parseable_wrong_rollout():
         {"is_correct": True, "answer_text": "42", "token_span": (18, 19)},
     ]
     assert select_group_rollout_pair(candidates) == (2, 0)
+
+
+def test_group_donors_use_self_when_correct_and_first_correct_when_wrong():
+    candidates = [
+        {"is_correct": False, "answer_text": "11", "token_span": (20, 21)},
+        {"is_correct": True, "answer_text": "42", "token_span": (18, 19)},
+        {"is_correct": True, "answer_text": "43", "token_span": (22, 23)},
+        {"is_correct": False, "answer_text": None, "token_span": None},
+    ]
+    assert select_group_answer_donors(candidates) == [1, 1, 2, 1]
+
+
+def test_group_donors_skip_group_without_locatable_correct_answer():
+    candidates = [
+        {"is_correct": False, "answer_text": "11", "token_span": (20, 21)},
+        {"is_correct": True, "answer_text": "42", "token_span": None},
+    ]
+    assert select_group_answer_donors(candidates) is None
 
 
 if __name__ == "__main__":

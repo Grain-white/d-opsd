@@ -190,7 +190,11 @@ class dOPSDConfig(TrainingArguments):
     teacher_conditioning: str = field(
         default="self_future",
         metadata={
-            "help": "Teacher construction: self_future, answer_prompt, answer_clamp, or answer_clamp_future."
+            "help": (
+                "Teacher construction: self_future, answer_prompt, answer_clamp, "
+                "answer_clamp_future, group_answer_prompt, group_answer_clamp, or "
+                "group_answer_self_future."
+            )
         },
     )
 
