@@ -1,3 +1,4 @@
+import json
 import os
 
 import torch
@@ -164,7 +165,9 @@ def main(opsd_config, model_config):
             raise ValueError("eval_only requires an explicit checkpoint path, not resume_from_checkpoint=true")
         if resume_from_checkpoint:
             trainer._load_from_checkpoint(resume_from_checkpoint)
-        trainer.evaluate()
+        metrics = trainer.evaluate()
+        if trainer.is_world_process_zero():
+            print("EVAL_ONLY_METRICS=" + json.dumps(metrics, sort_keys=True))
         return
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
