@@ -30,6 +30,7 @@ for step in $CHECKPOINT_STEPS; do
     EVAL_ON_START=true BETA=1 RESUME_FROM_CHECKPOINT="$checkpoint" \
     MAX_COMPLETION_LENGTH=256 BLOCK_LENGTH=32 DIFFUSION_STEPS=128 \
     BATCH_DIVIDE=8 NUM_ITERATIONS=8 GRADIENT_CHECKPOINTING=false \
+    EVAL_ONLY=true \
     SWANLAB_MODE=disabled \
     bash scripts/slurm/train_condition.sbatch
   echo "[$(date -Is)] DONE $run_name"

@@ -39,6 +39,7 @@ DIFFUSION_STEPS=${DIFFUSION_STEPS:-128}
 BATCH_DIVIDE=${BATCH_DIVIDE:-8}
 NUM_ITERATIONS=${NUM_ITERATIONS:-$BATCH_DIVIDE}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
+EVAL_ONLY=${EVAL_ONLY:-false}
 
 case "$CONDITION" in
   self_future|answer_prompt|answer_clamp|answer_clamp_future) ;;
@@ -130,4 +131,5 @@ cd "$REPO_ROOT/d-opsd"
   --run_name "$RUN_NAME" \
   --output_dir "$REPO_ROOT/outputs/checkpoints/$RUN_NAME" \
   --resume_from_checkpoint "$RESUME_FROM_CHECKPOINT" \
+  --eval_only "$EVAL_ONLY" \
   --report_to none

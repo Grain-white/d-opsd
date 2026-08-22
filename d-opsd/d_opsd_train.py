@@ -159,6 +159,13 @@ def main(opsd_config, model_config):
             resume_from_checkpoint = False
         elif lowered in {"true", "1", "yes"}:
             resume_from_checkpoint = True
+    if opsd_config.eval_only:
+        if resume_from_checkpoint is True:
+            raise ValueError("eval_only requires an explicit checkpoint path, not resume_from_checkpoint=true")
+        if resume_from_checkpoint:
+            trainer._load_from_checkpoint(resume_from_checkpoint)
+        trainer.evaluate()
+        return
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 

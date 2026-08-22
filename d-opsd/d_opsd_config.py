@@ -214,6 +214,11 @@ class dOPSDConfig(TrainingArguments):
         metadata={"help": "Size of the fixed held-out validation subset used during training."},
     )
 
+    eval_only: bool = field(
+        default=False,
+        metadata={"help": "Load model/adapter weights and evaluate without restoring optimizer state."},
+    )
+
     fixed_teacher: bool = field(
         default=True,
         metadata={
