@@ -424,7 +424,11 @@ class dOPSDTrainer(GRPOTrainer):
         kendall_tau = self.topk_kendall_tau(student_logits, teacher_logits, self.top_k_loss or 20)
         completion_positions = student_index - prompt_length
         final_completion_ids = inputs["final_completion_ids"].to(model.device)
-        target_ids = final_completion_ids[completion_positions]
+        if final_completion_ids.ndim == 2:
+            final_completion_ids = final_completion_ids[start_pos:end_pos]
+            target_ids = final_completion_ids[row_index, completion_positions]
+        else:
+            target_ids = final_completion_ids[completion_positions]
         student_target_prob = torch.gather(
             F.softmax(student_logits[:, 0].float(), dim=-1), 1, target_ids[:, None]
         ).mean()
@@ -833,6 +837,8 @@ class dOPSDTrainer(GRPOTrainer):
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         """Generate one shared rollout and construct the configured teacher."""
+        if self.teacher_conditioning == "group_answer_prompt":
+            return self._generate_group_answer_prompt(inputs)
         if self.teacher_conditioning in {"self_future", "reference_prompt"}:
             legacy = self._generate_and_score_completions_legacy(inputs)
             trajectory = legacy.pop("trajectory")
@@ -1179,4 +1185,279 @@ class dOPSDTrainer(GRPOTrainer):
             "span_status": span_status,
             "rollout_attempts": attempt,
             "final_completion_ids": final_sequence[prompt_length:].cpu(),
+        }
+
+    def _generate_group_answer_prompt(self, inputs):
+        """Condition every rollout in a fixed group on a correct group answer.
+
+        Correct rollouts use their own verified answers.  Incorrect rollouts use
+        the answer from the first correct rollout.  To keep the optimization
+        token budget comparable to a single-trajectory baseline, every rollout
+        contributes a balanced share of one trajectory's diffusion-state budget.
+        """
+        if len(inputs) != 1:
+            raise ValueError("Group answer prompting requires per-device batch size 1")
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        generation_started = time.perf_counter()
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        prompt_inputs = Trainer._prepare_inputs(self, prompt_inputs)
+        prompt_ids = prompt_inputs["input_ids"]
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length:]
+        prompt_length = prompt_ids.size(1)
+        gen_length = self.args.max_completion_length
+        active_group_size = self.passk if mode == "train" else self.eval_passk
+        candidates = []
+
+        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+            with torch.no_grad():
+                for attempt in range(1, active_group_size + 1):
+                    temperature = (self.args.temperature or 0.0) if attempt == 1 else self.passk_temperature
+                    prompt_completion_ids, batch_trajectory = generate(
+                        model=unwrapped_model,
+                        prompt=prompt_ids,
+                        steps=self.args.diffusion_steps,
+                        gen_length=gen_length,
+                        block_length=self.args.block_length,
+                        temperature=temperature,
+                        cfg_scale=self.args.cfg_scale,
+                        remasking=self.args.remasking,
+                        mask_id=self.args.mask_id,
+                        debug1=self.debug1,
+                        fp16=self.args.fp16,
+                    )
+                    completion_ids = prompt_completion_ids[0, prompt_length:].tolist()
+                    completion_text = self.processing_class.decode(completion_ids, skip_special_tokens=False)
+                    verification = get_all_parsed_answer_with_metadata(
+                        completion_text, inputs[0]["answer"], self.dataset_name
+                    )
+                    token_span = None
+                    span_status = "verifier_span_missing"
+                    if verification.char_span is not None:
+                        token_span, span_status = map_char_span_to_token_span(
+                            self.processing_class,
+                            completion_ids,
+                            completion_text,
+                            verification.char_span,
+                            verification.answer_text,
+                        )
+                    trajectory = torch.cat(batch_trajectory, dim=0)
+                    candidates.append({
+                        "attempt": attempt,
+                        "is_correct": bool(verification.is_correct),
+                        "verification": verification,
+                        "token_span": token_span,
+                        "span_status": span_status,
+                        "prompt_completion_ids": prompt_completion_ids[0],
+                        "trajectory": trajectory,
+                        "completion_text": completion_text,
+                    })
+
+        correct_candidates = [
+            candidate for candidate in candidates
+            if candidate["is_correct"]
+            and candidate["verification"].answer_text
+            and candidate["token_span"] is not None
+        ]
+        first_correct = correct_candidates[0] if correct_candidates else None
+        verifier_pass_at_1 = bool(candidates[0]["is_correct"])
+        group_success = first_correct is not None
+        group_correct_count = sum(candidate["is_correct"] for candidate in candidates)
+        generation_seconds = time.perf_counter() - generation_started
+
+        if not group_success:
+            candidate = candidates[0]
+            trajectory = candidate["trajectory"]
+            student_inputs = trajectory[:-1]
+            student_outputs = trajectory[1:]
+            teacher_inputs = student_inputs.clone()
+            privileged_mask = torch.zeros_like(teacher_inputs, dtype=torch.bool)
+            final_completion = candidate["prompt_completion_ids"][prompt_length:]
+            final_completion_ids = final_completion.expand(student_inputs.size(0), -1).clone()
+            teacher_prompt_length = prompt_length
+            eligible_state_ratio = 1.0
+            teacher_prompts_text = prompts_text
+            retained_per_recipient = [student_inputs.size(0)]
+        else:
+            state_budget = max(candidate["trajectory"].size(0) - 1 for candidate in candidates)
+            quotient, remainder = divmod(state_budget, len(candidates))
+            student_parts = []
+            student_output_parts = []
+            completion_parts = []
+            final_completion_parts = []
+            recipient_prompts = []
+            retained_per_recipient = []
+            eligible_ratios = []
+
+            for index, candidate in enumerate(candidates):
+                trajectory = candidate["trajectory"]
+                local_inputs = trajectory[:-1]
+                local_outputs = trajectory[1:]
+                token_span = candidate["token_span"]
+                if token_span is not None:
+                    absolute_span = (
+                        prompt_length + token_span[0],
+                        prompt_length + token_span[1],
+                    )
+                    eligible = fully_masked_rows(local_inputs, absolute_span, self.args.mask_id)
+                    eligible_rows = torch.where(eligible)[0]
+                else:
+                    eligible_rows = torch.arange(local_inputs.size(0), device=local_inputs.device)
+                eligible_ratios.append(float(eligible_rows.numel() / max(local_inputs.size(0), 1)))
+                quota = quotient + (1 if index < remainder else 0)
+                quota = min(quota, eligible_rows.numel())
+                if quota <= 0:
+                    retained_per_recipient.append(0)
+                    continue
+                if eligible_rows.numel() > quota:
+                    evenly_spaced = torch.linspace(
+                        0,
+                        eligible_rows.numel() - 1,
+                        steps=quota,
+                        device=eligible_rows.device,
+                    ).round().long()
+                    eligible_rows = eligible_rows[evenly_spaced]
+                local_inputs = local_inputs[eligible_rows]
+                local_outputs = local_outputs[eligible_rows]
+                retained_per_recipient.append(local_inputs.size(0))
+                student_parts.append(local_inputs)
+                student_output_parts.append(local_outputs)
+                completion_parts.append(local_inputs[:, prompt_length:])
+                final_completion = candidate["prompt_completion_ids"][prompt_length:]
+                final_completion_parts.append(final_completion.expand(local_inputs.size(0), -1))
+
+                answer_donor = candidate if candidate["is_correct"] else first_correct
+                teacher_example = dict(inputs[0])
+                teacher_example["prompt"] = build_answer_prompt(
+                    inputs[0]["prompt"], answer_donor["verification"].answer_text
+                )
+                recipient_prompts.append(
+                    maybe_apply_chat_template(teacher_example, self.processing_class)["prompt"]
+                )
+
+            if not student_parts:
+                raise ValueError("No eligible group diffusion states remain")
+            teacher_prompt_tokens = self.processing_class(
+                text=recipient_prompts,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                add_special_tokens=False,
+            )
+            teacher_prompt_tokens = Trainer._prepare_inputs(self, teacher_prompt_tokens)["input_ids"]
+            if self.teacher_max_prompt_length is not None:
+                teacher_prompt_tokens = teacher_prompt_tokens[:, -self.teacher_max_prompt_length:]
+            teacher_prompt_length = teacher_prompt_tokens.size(1)
+            teacher_parts = []
+            prompt_index = 0
+            for completion_part in completion_parts:
+                count = completion_part.size(0)
+                teacher_parts.append(torch.cat([
+                    teacher_prompt_tokens[prompt_index:prompt_index + 1].expand(count, -1),
+                    completion_part,
+                ], dim=1))
+                prompt_index += 1
+            student_inputs = torch.cat(student_parts, dim=0)
+            student_outputs = torch.cat(student_output_parts, dim=0)
+            teacher_inputs = torch.cat(teacher_parts, dim=0)
+            privileged_mask = torch.zeros_like(teacher_inputs, dtype=torch.bool)
+            final_completion_ids = torch.cat(final_completion_parts, dim=0)
+            teacher_prompts_text = recipient_prompts
+            eligible_state_ratio = float(sum(eligible_ratios) / len(eligible_ratios))
+
+        completion_lengths = []
+        eos_id = self.processing_class.eos_token_id
+        for candidate in candidates:
+            completion = candidate["prompt_completion_ids"][prompt_length:]
+            eos_positions = torch.where(completion == eos_id)[0] if eos_id is not None else []
+            completion_lengths.append(int(eos_positions[0]) if len(eos_positions) else completion.numel())
+        metrics = {
+            "completion_length": float(sum(completion_lengths) / len(completion_lengths)),
+            "iter_num": float(active_group_size),
+            "rollout_attempts": float(active_group_size),
+            "passk_success": float(group_success),
+            "verifier_accuracy": float(group_success),
+            "verifier_pass_at_1": float(verifier_pass_at_1),
+            "conditioning_available": float(group_success),
+            "span_locatable": float(sum(c["token_span"] is not None for c in candidates) / len(candidates)),
+            "eligible_state_ratio": eligible_state_ratio,
+            "generation_seconds": generation_seconds,
+            "rollout_tokens_per_second": float(
+                gen_length * active_group_size / max(generation_seconds, 1e-6)
+            ),
+            "group_size": float(len(candidates)),
+            "group_correct_rollouts": float(group_correct_count),
+            "group_wrong_rollouts": float(len(candidates) - group_correct_count),
+            "group_self_prompted": float(group_correct_count if group_success else 0),
+            "group_donor_prompted": float(len(candidates) - group_correct_count if group_success else 0),
+            "group_trained_recipients": float(len([count for count in retained_per_recipient if count > 0]) if group_success else 0),
+            "group_retained_states": float(sum(retained_per_recipient) if group_success else 0),
+        }
+        if active_group_size >= 8:
+            metrics["verifier_pass_at_8"] = float(group_success)
+        elif active_group_size != 1:
+            metrics[f"verifier_pass_at_{active_group_size}"] = float(group_success)
+        for name, value in metrics.items():
+            gathered = self.accelerator.gather_for_metrics(
+                torch.tensor(value, device=device, dtype=torch.float32)
+            ).mean().item()
+            self._metrics[mode][name].append(gathered)
+
+        if self.log_completions and self.state.global_step % self.args.completion_logging_steps == 0:
+            prompts_to_log = gather_object([prompts_text[0]] * len(candidates))
+            completions_to_log = gather_object([candidate["completion_text"] for candidate in candidates])
+            rewards_to_log = gather_object([float(candidate["is_correct"]) for candidate in candidates])
+            if self.accelerator.is_main_process:
+                print_prompt_completions_sample(
+                    prompts_to_log,
+                    completions_to_log,
+                    rewards_to_log,
+                    self._step,
+                )
+                artifact_path = Path(self.args.output_dir) / "conditioning_samples.jsonl"
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                with artifact_path.open("a", encoding="utf-8") as handle:
+                    for index, candidate in enumerate(candidates):
+                        answer_donor = candidate if candidate["is_correct"] else first_correct
+                        handle.write(json.dumps({
+                            "global_step": self.state.global_step,
+                            "teacher_conditioning": self.teacher_conditioning,
+                            "recipient_index": index,
+                            "recipient_correct": candidate["is_correct"],
+                            "recipient_completion": candidate["completion_text"],
+                            "teacher_prompt": teacher_prompts_text[index] if group_success else prompts_text[0],
+                            "donor_answer": (
+                                answer_donor["verification"].answer_text if answer_donor is not None else None
+                            ),
+                            "uses_own_answer": bool(candidate["is_correct"] and group_success),
+                            "group_success": group_success,
+                            "retained_states": retained_per_recipient[index] if index < len(retained_per_recipient) else 0,
+                        }, ensure_ascii=False) + "\n")
+
+        return {
+            "prompt_length": prompt_length,
+            "teacher_prompt_length": teacher_prompt_length,
+            "student_inputs": student_inputs.cpu(),
+            "student_outputs": student_outputs.cpu(),
+            "teacher_inputs": teacher_inputs.cpu(),
+            "privileged_mask": privileged_mask.cpu(),
+            "steps": self.args.diffusion_steps,
+            "gen_length": gen_length,
+            "block_length": self.args.block_length,
+            "is_correct": bool(group_success),
+            "conditioning_available": bool(group_success),
+            "eligible_state_ratio": eligible_state_ratio,
+            "answer_token_span": None,
+            "answer_source": first_correct["verification"].source if first_correct else None,
+            "span_status": "group_mixed",
+            "rollout_attempts": active_group_size,
+            "final_completion_ids": final_completion_ids.cpu(),
         }
