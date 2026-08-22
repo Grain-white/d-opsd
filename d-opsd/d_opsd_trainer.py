@@ -894,6 +894,7 @@ class dOPSDTrainer(GRPOTrainer):
         verifier_pass_at_1 = False  # first-attempt (usually T=0) verifier correctness
         group_candidates = []
         group_pair_available = False
+        group_positive_fallback = False
         group_donor_attempt = 0
         group_recipient_attempt = 0
         recipient_is_correct = False
@@ -923,7 +924,7 @@ class dOPSDTrainer(GRPOTrainer):
                             verification.answer_text,
                         )
                     if self.teacher_conditioning == "group_answer_prompt":
-                        group_candidates.append({
+                        candidate = {
                             "attempt": attempt,
                             "is_correct": bool(verification.is_correct),
                             "answer_text": verification.answer_text,
@@ -933,7 +934,15 @@ class dOPSDTrainer(GRPOTrainer):
                             "prompt_completion_ids": batch_prompt_completion_ids,
                             "trajectory": batch_trajectory,
                             "completion_text": completion_text,
-                        })
+                        }
+                        group_candidates.append(candidate)
+                        # Preserve exact compute parity with answer_prompt.  A
+                        # correct first rollout follows the original positive-
+                        # trajectory path.  Only when the first rollout is wrong
+                        # do later attempts donate their correct answer to it.
+                        if attempt == 1 and verification.is_correct and candidate_token_span is not None:
+                            group_positive_fallback = True
+                            break
                         donor_index, recipient_index = select_group_rollout_pair(group_candidates)
                         if donor_index is not None and recipient_index is not None:
                             group_pair_available = True
@@ -944,10 +953,15 @@ class dOPSDTrainer(GRPOTrainer):
                         if verification.is_correct and answer_token_span is not None:
                             break
 
-        if self.teacher_conditioning == "group_answer_prompt" and group_pair_available:
-            donor_index, recipient_index = select_group_rollout_pair(group_candidates)
-            donor = group_candidates[donor_index]
-            recipient = group_candidates[recipient_index]
+        if self.teacher_conditioning == "group_answer_prompt" and (
+            group_pair_available or group_positive_fallback
+        ):
+            if group_positive_fallback:
+                donor = recipient = group_candidates[0]
+            else:
+                donor_index, recipient_index = select_group_rollout_pair(group_candidates)
+                donor = group_candidates[donor_index]
+                recipient = group_candidates[recipient_index]
             verification = donor["verification"]
             answer_token_span = recipient["token_span"]
             span_status = recipient["span_status"]
@@ -959,7 +973,10 @@ class dOPSDTrainer(GRPOTrainer):
             recipient_is_correct = bool(recipient["is_correct"])
 
         if self.teacher_conditioning == "group_answer_prompt":
-            conditioning_available = bool(group_pair_available and answer_token_span is not None)
+            conditioning_available = bool(
+                (group_pair_available or group_positive_fallback)
+                and answer_token_span is not None
+            )
         else:
             conditioning_available = bool(verifier_correct and answer_token_span is not None)
         is_correct = conditioning_available
@@ -1091,6 +1108,7 @@ class dOPSDTrainer(GRPOTrainer):
         if self.teacher_conditioning == "group_answer_prompt":
             metrics.update({
                 "group_pair_available": float(group_pair_available),
+                "group_positive_fallback": float(group_positive_fallback),
                 "group_donor_attempt": float(group_donor_attempt),
                 "group_recipient_attempt": float(group_recipient_attempt),
                 "group_recipient_correct": float(recipient_is_correct),
@@ -1138,6 +1156,7 @@ class dOPSDTrainer(GRPOTrainer):
                         "conditioning_available": conditioning_available,
                         "eligible_state_ratio": eligible_state_ratio,
                         "group_pair_available": group_pair_available,
+                        "group_positive_fallback": group_positive_fallback,
                         "group_donor_attempt": group_donor_attempt,
                         "group_recipient_attempt": group_recipient_attempt,
                     }, ensure_ascii=False) + "\n")

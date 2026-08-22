@@ -125,6 +125,15 @@ def test_group_pair_requires_a_parseable_incorrect_recipient():
     assert select_group_rollout_pair(candidates) == (0, None)
 
 
+def test_group_pair_keeps_the_earliest_parseable_wrong_rollout():
+    candidates = [
+        {"is_correct": False, "answer_text": "11", "token_span": (20, 21)},
+        {"is_correct": False, "answer_text": "12", "token_span": (22, 23)},
+        {"is_correct": True, "answer_text": "42", "token_span": (18, 19)},
+    ]
+    assert select_group_rollout_pair(candidates) == (2, 0)
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

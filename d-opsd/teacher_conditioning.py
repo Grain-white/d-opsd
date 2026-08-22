@@ -45,7 +45,9 @@ def build_answer_prompt(messages, answer_text: str):
 def select_group_rollout_pair(candidates):
     """Select a correct answer donor and a parseable incorrect recipient.
 
-    Candidates are kept in sampling order.  The donor only needs the exact
+    Candidates are kept in sampling order.  This helper covers the branch where
+    the first rollout was wrong; a correct first rollout uses the original
+    answer-prompt path directly.  The donor only needs the exact
     verifier-accepted answer text because answer-prompt conditioning does not
     copy its trajectory.  The incorrect recipient needs a token span for its
     own final answer slot so that training can be restricted to states before
@@ -55,7 +57,9 @@ def select_group_rollout_pair(candidates):
         (
             index
             for index, candidate in enumerate(candidates)
-            if candidate["is_correct"] and candidate.get("answer_text")
+            if candidate["is_correct"]
+            and candidate.get("answer_text")
+            and candidate.get("token_span") is not None
         ),
         None,
     )
