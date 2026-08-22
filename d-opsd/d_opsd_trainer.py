@@ -1108,7 +1108,7 @@ class dOPSDTrainer(GRPOTrainer):
         if self.log_completions and self.state.global_step % self.args.completion_logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
-            logged_reward = recipient_is_correct if self.teacher_conditioning == "group_answer_prompt" else verifier_correct
+            logged_reward = recipient_is_correct if group_pair_available else verifier_correct
             rewards_to_log = gather_object([float(logged_reward)])
             if self.accelerator.is_main_process:
                 print_prompt_completions_sample(
