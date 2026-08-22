@@ -5,6 +5,7 @@ REPO_ROOT=${REPO_ROOT:-/home/fit/alex1/WORK/Meiqi.Gu/d-opsd}
 SLURM_BIN=${SLURM_BIN:-/rmprog/slurm/v24.05.1/bin}
 PARTITION=${PARTITION:-a01}
 SMOKE_TAG=${SMOKE_TAG:-group-three-smoke-v1}
+SMOKE_STEPS=${SMOKE_STEPS:-1}
 CONDITIONS=${CONDITIONS:-"group_answer_prompt group_answer_clamp group_answer_self_future"}
 
 case "$PARTITION" in
@@ -24,9 +25,9 @@ cd "$REPO_ROOT"
 for condition in $CONDITIONS; do
   run_name="${condition}-gsm-seed42-${SMOKE_TAG}"
   env \
-    CONDITION="$condition" DATASET=gsm8k SEED=42 MAX_STEPS=1 \
+    CONDITION="$condition" DATASET=gsm8k SEED=42 MAX_STEPS="$SMOKE_STEPS" \
     PASS_K=8 EVAL_PASS_K=1 RUN_NAME="$run_name" NUM_PROCESSES=1 \
-    SAVE_STEPS=1 EVAL_STEPS=1 VALIDATION_SAMPLES=2 EVAL_ON_START=true \
+    SAVE_STEPS="$SMOKE_STEPS" EVAL_STEPS="$SMOKE_STEPS" VALIDATION_SAMPLES=2 EVAL_ON_START=true \
     BETA=1 RESUME_FROM_CHECKPOINT=false MAX_COMPLETION_LENGTH=256 \
     BLOCK_LENGTH=32 DIFFUSION_STEPS=128 BATCH_DIVIDE=8 NUM_ITERATIONS=8 \
     GRADIENT_CHECKPOINTING=false SWANLAB_MODE=disabled \
