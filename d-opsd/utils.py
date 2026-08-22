@@ -26,7 +26,7 @@ def set_random_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 def main_print(content):
-    if int(os.environ["LOCAL_RANK"]) <= 0:
+    if int(os.environ.get("LOCAL_RANK", "0")) <= 0:
         print(content)
 
 def get_num_transfer_tokens(mask_index, steps):

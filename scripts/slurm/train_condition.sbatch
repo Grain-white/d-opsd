@@ -105,7 +105,6 @@ ACCELERATE_CONFIG_FILE=accelerate.yaml
 if [[ "$EVAL_ONLY" == "true" ]]; then
   ACCELERATE_CONFIG_FILE=accelerate_eval.yaml
   NUM_PROCESSES=1
-  export LOCAL_RANK=${LOCAL_RANK:-0}
 fi
 "$PYTHON" -m accelerate.commands.launch \
   --config_file "$ACCELERATE_CONFIG_FILE" \
