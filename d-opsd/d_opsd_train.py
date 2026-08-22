@@ -166,6 +166,7 @@ def main(opsd_config, model_config):
         if resume_from_checkpoint:
             trainer._load_from_checkpoint(resume_from_checkpoint)
         metrics = trainer.evaluate()
+        metrics.update(getattr(trainer, "_last_eval_metrics", {}))
         if trainer.is_world_process_zero():
             print("EVAL_ONLY_METRICS=" + json.dumps(metrics, sort_keys=True))
         return

@@ -175,6 +175,12 @@ class dOPSDTrainer(GRPOTrainer):
         is_eval_log = any(key.startswith("eval_") for key in logs)
         previous_should_evaluate = self.control.should_evaluate
         self.control.should_evaluate = is_eval_log
+        if is_eval_log:
+            self._last_eval_metrics = {
+                f"eval_{key}": sum(values) / len(values)
+                for key, values in self._metrics["eval"].items()
+                if values
+            }
         try:
             return super().log(logs, start_time)
         finally:
