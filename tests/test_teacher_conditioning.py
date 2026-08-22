@@ -15,6 +15,7 @@ from teacher_conditioning import (  # noqa: E402
     fully_masked_rows,
     map_char_span_to_token_span,
     sample_future_hint_positions,
+    select_group_rollout_pair,
     split_bounds,
 )
 from utils import get_all_parsed_answer_with_metadata  # noqa: E402
@@ -105,6 +106,23 @@ def test_future_hints_are_eligible_and_reproducible():
     assert first == second
     assert first
     assert set(first).issubset(eligible)
+
+
+def test_group_pair_uses_correct_donor_and_incorrect_recipient():
+    candidates = [
+        {"is_correct": False, "answer_text": "11", "token_span": (20, 21)},
+        {"is_correct": True, "answer_text": "42", "token_span": (18, 19)},
+        {"is_correct": False, "answer_text": None, "token_span": None},
+    ]
+    assert select_group_rollout_pair(candidates) == (1, 0)
+
+
+def test_group_pair_requires_a_parseable_incorrect_recipient():
+    candidates = [
+        {"is_correct": True, "answer_text": "42", "token_span": (18, 19)},
+        {"is_correct": False, "answer_text": None, "token_span": None},
+    ]
+    assert select_group_rollout_pair(candidates) == (0, None)
 
 
 if __name__ == "__main__":

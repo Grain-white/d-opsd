@@ -40,6 +40,7 @@ from teacher_conditioning import (
     fully_masked_rows,
     map_char_span_to_token_span,
     sample_future_hint_positions,
+    select_group_rollout_pair,
     split_bounds,
 )
 
@@ -117,7 +118,13 @@ class dOPSDTrainer(GRPOTrainer):
         self.diff_student_mask = args.diff_student_mask
         self.dataset_name = args.dataset
         self.sudoku_threshold = args.sudoku_threshold
-        valid_conditioning = {"self_future", "answer_prompt", "answer_clamp", "answer_clamp_future"}
+        valid_conditioning = {
+            "self_future",
+            "answer_prompt",
+            "group_answer_prompt",
+            "answer_clamp",
+            "answer_clamp_future",
+        }
         if self.add_ref:
             warnings.warn(
                 "add_ref is a legacy full-solution baseline and is not information-matched. "
@@ -129,7 +136,12 @@ class dOPSDTrainer(GRPOTrainer):
             raise ValueError(f"teacher_conditioning must be one of {sorted(valid_conditioning)}")
         if self.rollout_filter not in {"correct_only", "all"}:
             raise ValueError("rollout_filter must be 'correct_only' or 'all'")
-        if self.fixed_teacher_tokens_remask and self.teacher_conditioning.startswith("answer_"):
+        if self.fixed_teacher_tokens_remask and self.teacher_conditioning in {
+            "answer_prompt",
+            "group_answer_prompt",
+            "answer_clamp",
+            "answer_clamp_future",
+        }:
             raise NotImplementedError(
                 "Stochastic remasking is intentionally excluded from the primary experiment. "
                 "Set fixed_teacher_tokens_remask=false."
@@ -138,7 +150,7 @@ class dOPSDTrainer(GRPOTrainer):
             raise ValueError("Future hint ratios must satisfy 0 <= min <= max <= 1")
         if not (1 <= self.future_hint_chunk_min <= self.future_hint_chunk_max):
             raise ValueError("Future hint chunk sizes must satisfy 1 <= min <= max")
-        if self.teacher_conditioning in {"answer_prompt", "reference_prompt"}:
+        if self.teacher_conditioning in {"answer_prompt", "group_answer_prompt", "reference_prompt"}:
             self.teacher_max_prompt_length = args.teacher_max_prompt_length
         if args.max_grad_norm is not None:
             main_print(f'max_grad is {args.max_grad_norm}')
@@ -467,7 +479,12 @@ class dOPSDTrainer(GRPOTrainer):
             accepted = is_correct >= self.sudoku_threshold
         else:
             accepted = bool(is_correct)
-        if self.teacher_conditioning.startswith("answer_") and not inputs.get("conditioning_available", False):
+        if self.teacher_conditioning in {
+            "answer_prompt",
+            "group_answer_prompt",
+            "answer_clamp",
+            "answer_clamp_future",
+        } and not inputs.get("conditioning_available", False):
             return loss * 0.0
         if self.rollout_filter == "all" or accepted or self.teacher_conditioning == "reference_prompt":
             return loss
@@ -875,6 +892,11 @@ class dOPSDTrainer(GRPOTrainer):
         span_status = "not_checked"
         verifier_correct = False  # pass@k: True if any attempt is verifier-correct
         verifier_pass_at_1 = False  # first-attempt (usually T=0) verifier correctness
+        group_candidates = []
+        group_pair_available = False
+        group_donor_attempt = 0
+        group_recipient_attempt = 0
+        recipient_is_correct = False
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             with torch.no_grad():
                 active_passk = self.eval_passk if mode == "eval" else self.passk
@@ -890,21 +912,56 @@ class dOPSDTrainer(GRPOTrainer):
                         verifier_correct = True
                         if attempt == 1:
                             verifier_pass_at_1 = True
-                    answer_token_span = None
-                    if verification.is_correct and verification.char_span is not None:
-                        answer_token_span, span_status = map_char_span_to_token_span(
+                    candidate_token_span = None
+                    candidate_span_status = "verifier_span_missing"
+                    if verification.char_span is not None:
+                        candidate_token_span, candidate_span_status = map_char_span_to_token_span(
                             self.processing_class,
                             completion_ids,
                             completion_text,
                             verification.char_span,
                             verification.answer_text,
                         )
-                    elif verification.is_correct:
-                        span_status = "verifier_span_missing"
-                    if verification.is_correct and answer_token_span is not None:
-                        break
+                    if self.teacher_conditioning == "group_answer_prompt":
+                        group_candidates.append({
+                            "attempt": attempt,
+                            "is_correct": bool(verification.is_correct),
+                            "answer_text": verification.answer_text,
+                            "verification": verification,
+                            "token_span": candidate_token_span,
+                            "span_status": candidate_span_status,
+                            "prompt_completion_ids": batch_prompt_completion_ids,
+                            "trajectory": batch_trajectory,
+                            "completion_text": completion_text,
+                        })
+                        donor_index, recipient_index = select_group_rollout_pair(group_candidates)
+                        if donor_index is not None and recipient_index is not None:
+                            group_pair_available = True
+                            break
+                    else:
+                        answer_token_span = candidate_token_span
+                        span_status = candidate_span_status
+                        if verification.is_correct and answer_token_span is not None:
+                            break
 
-        conditioning_available = bool(verifier_correct and answer_token_span is not None)
+        if self.teacher_conditioning == "group_answer_prompt" and group_pair_available:
+            donor_index, recipient_index = select_group_rollout_pair(group_candidates)
+            donor = group_candidates[donor_index]
+            recipient = group_candidates[recipient_index]
+            verification = donor["verification"]
+            answer_token_span = recipient["token_span"]
+            span_status = recipient["span_status"]
+            batch_prompt_completion_ids = recipient["prompt_completion_ids"]
+            batch_trajectory = recipient["trajectory"]
+            completion_text = recipient["completion_text"]
+            group_donor_attempt = donor["attempt"]
+            group_recipient_attempt = recipient["attempt"]
+            recipient_is_correct = bool(recipient["is_correct"])
+
+        if self.teacher_conditioning == "group_answer_prompt":
+            conditioning_available = bool(group_pair_available and answer_token_span is not None)
+        else:
+            conditioning_available = bool(verifier_correct and answer_token_span is not None)
         is_correct = conditioning_available
         trajectory = torch.cat(batch_trajectory, dim=0)
         final_sequence = batch_prompt_completion_ids[0]
@@ -923,7 +980,7 @@ class dOPSDTrainer(GRPOTrainer):
             answer_absolute_span = (prompt_length + answer_start, prompt_length + answer_end)
             eligible = fully_masked_rows(student_inputs, answer_absolute_span, self.args.mask_id)
             eligible_rows = torch.where(eligible)[0]
-            if self.teacher_conditioning == "answer_prompt":
+            if self.teacher_conditioning in {"answer_prompt", "group_answer_prompt"}:
                 teacher_example = dict(inputs[0])
                 teacher_example["prompt"] = build_answer_prompt(
                     inputs[0]["prompt"], verification.answer_text
@@ -1031,6 +1088,13 @@ class dOPSDTrainer(GRPOTrainer):
                 verification is not None and verification.source == "answer_tag"
             ),
         }
+        if self.teacher_conditioning == "group_answer_prompt":
+            metrics.update({
+                "group_pair_available": float(group_pair_available),
+                "group_donor_attempt": float(group_donor_attempt),
+                "group_recipient_attempt": float(group_recipient_attempt),
+                "group_recipient_correct": float(recipient_is_correct),
+            })
         if active_passk >= 8:
             metrics["verifier_pass_at_8"] = float(verifier_correct)
         elif active_passk != 1:
@@ -1044,7 +1108,8 @@ class dOPSDTrainer(GRPOTrainer):
         if self.log_completions and self.state.global_step % self.args.completion_logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
-            rewards_to_log = gather_object([float(verifier_correct)])
+            logged_reward = recipient_is_correct if self.teacher_conditioning == "group_answer_prompt" else verifier_correct
+            rewards_to_log = gather_object([float(logged_reward)])
             if self.accelerator.is_main_process:
                 print_prompt_completions_sample(
                     prompts_to_log,
@@ -1072,6 +1137,9 @@ class dOPSDTrainer(GRPOTrainer):
                         "span_status": span_status,
                         "conditioning_available": conditioning_available,
                         "eligible_state_ratio": eligible_state_ratio,
+                        "group_pair_available": group_pair_available,
+                        "group_donor_attempt": group_donor_attempt,
+                        "group_recipient_attempt": group_recipient_attempt,
                     }, ensure_ascii=False) + "\n")
 
         return {

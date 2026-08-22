@@ -42,7 +42,7 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 EVAL_ONLY=${EVAL_ONLY:-false}
 
 case "$CONDITION" in
-  self_future|answer_prompt|answer_clamp|answer_clamp_future) ;;
+  self_future|answer_prompt|group_answer_prompt|answer_clamp|answer_clamp_future) ;;
   *) echo "Unknown CONDITION=$CONDITION" >&2; exit 2 ;;
 esac
 

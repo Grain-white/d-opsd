@@ -42,6 +42,34 @@ def build_answer_prompt(messages, answer_text: str):
     return teacher_messages
 
 
+def select_group_rollout_pair(candidates):
+    """Select a correct answer donor and a parseable incorrect recipient.
+
+    Candidates are kept in sampling order.  The donor only needs the exact
+    verifier-accepted answer text because answer-prompt conditioning does not
+    copy its trajectory.  The incorrect recipient needs a token span for its
+    own final answer slot so that training can be restricted to states before
+    that (incorrect) answer is naturally revealed.
+    """
+    donor_index = next(
+        (
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate["is_correct"] and candidate.get("answer_text")
+        ),
+        None,
+    )
+    recipient_index = next(
+        (
+            index
+            for index, candidate in enumerate(candidates)
+            if not candidate["is_correct"] and candidate.get("token_span") is not None
+        ),
+        None,
+    )
+    return donor_index, recipient_index
+
+
 def _find_subsequence(sequence: Sequence[int], needle: Sequence[int]):
     if not needle or len(needle) > len(sequence):
         return []
