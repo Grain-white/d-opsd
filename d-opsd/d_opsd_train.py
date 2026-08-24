@@ -32,6 +32,16 @@ from data_utils import (
 from utils import set_random_seed
 
 
+def swanlab_condition_tag(condition):
+    """Keep conditioning tags within SwanLab's 20-character limit."""
+    aliases = {
+        "group_answer_prompt": "grp-answer-prompt",
+        "group_answer_clamp": "grp-answer-clamp",
+        "group_answer_self_future": "grp-self-future",
+    }
+    return aliases.get(condition, condition)
+
+
 def main(opsd_config, model_config):
     # Set seed for reproducibility
     set_random_seed(opsd_config.seed)
@@ -128,7 +138,11 @@ def main(opsd_config, model_config):
             ),
             log_dir=os.path.join(opsd_config.output_dir, "swanlab"),
             mode=swanlab_mode,
-            tags=[opsd_config.teacher_conditioning, opsd_config.dataset, f"seed-{opsd_config.seed}"],
+            tags=[
+                swanlab_condition_tag(opsd_config.teacher_conditioning),
+                opsd_config.dataset,
+                f"seed-{opsd_config.seed}",
+            ],
         )
         # SwanLabCallback drops unknown kwargs; inject resume id explicitly so
         # SWANLAB_RUN_ID continues the same cloud experiment instead of creating a new one.
