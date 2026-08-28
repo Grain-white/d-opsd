@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from dataclasses import dataclass, asdict
+from decimal import Decimal, InvalidOperation
 
 
 '''
@@ -84,13 +85,7 @@ def get_all_parsed_answer(generation, answer, dataset):
 def get_all_parsed_answer_with_metadata(generation, answer, dataset):
     if dataset == "gsm8k":
         parsed_answer, char_span, answer_text, source = get_parsed_answer_with_span(generation)
-        try:
-            is_correct = parsed_answer is not None and parsed_answer == float(answer)
-        except ValueError:
-            is_correct = (
-                parsed_answer is not None 
-                and str(parsed_answer) == answer
-            )
+        is_correct = grade_boxed_answer(parsed_answer, answer)
     elif dataset == "math":
         parsed_answer = get_parsed_answer_math(generation, answer)
         char_span, answer_text, source = get_math_answer_span(generation)
@@ -123,69 +118,73 @@ def get_parsed_answer(raw_generation, ground_truth):
 
 
 def get_parsed_answer_with_span(raw_generation):
-    parsed_answer = None
-    char_span = None
-    answer_text = None
-    source = None
-    boxed_matches = list(re.finditer(r"\\boxed{(.*?)}", raw_generation, re.DOTALL))
+    """Return the exact final boxed answer and its content span.
 
-    if boxed_matches:
-        for boxed_match in boxed_matches:
-            boxed_content = boxed_match.group(1)
-            # boxed_content = boxed_content.strip()
-            boxed_content = boxed_content.strip().replace(",", "") 
-            if boxed_content and boxed_content != "..." and not re.match(r"^\.+$", boxed_content):
-                try:
-                    parsed_answer = float(boxed_content)
-                    raw_content = boxed_match.group(1)
-                    left_trim = len(raw_content) - len(raw_content.lstrip())
-                    right_trim = len(raw_content.rstrip())
-                    char_span = (boxed_match.start(1) + left_trim, boxed_match.start(1) + right_trim)
-                    answer_text = raw_generation[char_span[0]:char_span[1]]
-                    source = "boxed"
-                    break
-                except ValueError:
-                    numbers = list(re.finditer(r"-?\d[\d,]*(?:\.\d+)?", boxed_match.group(1)))
-                    if numbers:
-                        try:
-                            number_match = numbers[0]
-                            answer_text = number_match.group(0)
-                            parsed_answer = float(answer_text.replace(",", ""))
-                            char_span = (
-                                boxed_match.start(1) + number_match.start(),
-                                boxed_match.start(1) + number_match.end(),
-                            )
-                            source = "boxed"
-                            break
-                        except ValueError:
-                            pass
-    if parsed_answer is None:
-        answer_match = re.search(r"<answer>(.*?)</answer>", raw_generation, re.DOTALL)
-        if answer_match:
-            answer_text = answer_match.group(1).strip()
-            if answer_text:
-                try:
-                    parsed_answer = float(answer_text)
-                    left_trim = len(answer_match.group(1)) - len(answer_match.group(1).lstrip())
-                    right_trim = len(answer_match.group(1).rstrip())
-                    char_span = (answer_match.start(1) + left_trim, answer_match.start(1) + right_trim)
-                    answer_text = raw_generation[char_span[0]:char_span[1]]
-                    source = "answer_tag"
-                except ValueError:
-                    numbers = list(re.finditer(r"-?\d[\d,]*(?:\.\d+)?", answer_match.group(1)))
-                    if numbers:
-                        try:
-                            number_match = numbers[-1]
-                            answer_text = number_match.group(0)
-                            parsed_answer = float(answer_text.replace(",", ""))
-                            char_span = (
-                                answer_match.start(1) + number_match.start(),
-                                answer_match.start(1) + number_match.end(),
-                            )
-                            source = "answer_tag"
-                        except ValueError:
-                            pass
-    return parsed_answer, char_span, answer_text, source
+    This intentionally matches RLCSD ``src.opsd_format.extract_boxed_answer``:
+    only the last ``\\boxed`` occurrence is considered, nested braces are
+    supported, and answer-tag or loose-number fallbacks are forbidden.
+    """
+    if raw_generation is None:
+        return None, None, None, None
+    boxed_start = raw_generation.rfind("\\boxed")
+    if boxed_start < 0:
+        return None, None, None, None
+
+    depth = 0
+    right_brace = None
+    for index in range(boxed_start, len(raw_generation)):
+        if raw_generation[index] == "{":
+            depth += 1
+        elif raw_generation[index] == "}":
+            depth -= 1
+            if depth == 0:
+                right_brace = index
+                break
+    if right_brace is None or not raw_generation.startswith("\\boxed{", boxed_start):
+        return None, None, None, None
+
+    content_start = boxed_start + len("\\boxed{")
+    raw_content = raw_generation[content_start:right_brace]
+    left_trim = len(raw_content) - len(raw_content.lstrip())
+    right_trim = len(raw_content.rstrip())
+    char_span = (content_start + left_trim, content_start + right_trim)
+    answer_text = raw_generation[slice(*char_span)]
+    return answer_text, char_span, answer_text, "boxed"
+
+
+def _canonical_simple_number(text):
+    text = str(text).strip().strip("$").replace(",", "").replace(" ", "").replace("−", "-")
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
+def grade_boxed_answer(predicted, ground_truth):
+    """Official OPSD numeric shortcut + math_verify + string fallback."""
+    if predicted is None:
+        return False
+    pred_number = _canonical_simple_number(predicted)
+    gold_number = _canonical_simple_number(ground_truth)
+    if pred_number is not None and gold_number is not None:
+        return pred_number == gold_number
+    try:
+        from math_verify import parse, verify
+
+        pred_text = predicted if "$" in str(predicted) else f"${predicted}$"
+        gold_text = ground_truth if "$" in str(ground_truth) else f"${ground_truth}$"
+        return bool(
+            verify(
+                parse(gold_text, fallback_mode="no_fallback"),
+                parse(pred_text, fallback_mode="no_fallback"),
+                timeout_seconds=5,
+            )
+        )
+    except Exception:
+        normalize = lambda value: str(value).replace("$", "").replace(" ", "").lower().strip()
+        return normalize(predicted) == normalize(ground_truth)
 
 def fix_fracs(string):
     substrs = string.split("\\frac")

@@ -39,21 +39,29 @@ class CharacterTokenizer:
 
 
 def test_gsm_verifier_returns_the_exact_span_it_used():
-    text = "first \\boxed{1,234}; later <answer>-9</answer>"
+    text = "first \\boxed{-9}; final \\boxed{1,234}"
     result = get_all_parsed_answer_with_metadata(text, "1234", "gsm8k")
     assert result.is_correct
-    assert result.parsed_answer == 1234.0
+    assert result.parsed_answer == "1,234"
     assert result.answer_text == "1,234"
     assert text[slice(*result.char_span)] == result.answer_text
     assert result.source == "boxed"
 
 
-def test_answer_tag_uses_last_numeric_value_like_existing_verifier():
+def test_gsm_verifier_rejects_answer_tag_only_output():
     text = "<answer>calculation 3, final -2.5</answer>"
     result = get_all_parsed_answer_with_metadata(text, "-2.5", "gsm8k")
+    assert not result.is_correct
+    assert result.parsed_answer is None
+    assert result.char_span is None
+
+
+def test_gsm_verifier_supports_nested_final_box():
+    text = "trial \\boxed{1}; final \\boxed{\\frac{1}{2}}"
+    result = get_all_parsed_answer_with_metadata(text, "\\frac{1}{2}", "gsm8k")
     assert result.is_correct
-    assert result.answer_text == "-2.5"
-    assert text[slice(*result.char_span)] == "-2.5"
+    assert result.answer_text == "\\frac{1}{2}"
+    assert text[slice(*result.char_span)] == result.answer_text
 
 
 def test_math_verifier_locates_nested_last_box():
