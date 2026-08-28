@@ -33,6 +33,8 @@ class GSM8KDataset(torch.utils.data.Dataset):
         subsample=-1,
         split="test",
         add_ref=False,
+        seeded_prefix_subset=False,
+        subset_seed=42,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -41,13 +43,16 @@ class GSM8KDataset(torch.utils.data.Dataset):
         self.split = split
         self.add_ref = add_ref
         self.load_test_dataset()
+        if seeded_prefix_subset:
+            self.dataset = self.dataset.shuffle(seed=subset_seed)
         self.create_few_shot_prompt()
 
-        self.subsample = (
-            np.random.choice(len(self.dataset), subsample, replace=False)
-            if subsample != -1
-            else np.arange(len(self.dataset))
-        )
+        if subsample == -1:
+            self.subsample = np.arange(len(self.dataset))
+        elif seeded_prefix_subset:
+            self.subsample = np.arange(subsample)
+        else:
+            self.subsample = np.random.choice(len(self.dataset), subsample, replace=False)
         print(f"evaluating {len(self.subsample)} examples")
         assert subsample <= len(self.dataset), "Subsample size is greater than dataset size"
 

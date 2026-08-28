@@ -392,6 +392,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_answer_per_question", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--seeded_prefix_subset",
+        action="store_true",
+        help="Shuffle the dataset with --seed and take the first --max_examples rows.",
+    )
+    parser.add_argument(
         "--max_examples",
         type=int,
         default=-1,
@@ -429,6 +434,8 @@ if __name__ == "__main__":
         add_reasoning=True,  # prefill for all models
         split=args.split,
         add_ref=args.add_ref,
+        seeded_prefix_subset=args.seeded_prefix_subset,
+        subset_seed=args.seed,
     )
 
     dataloader = DataLoader(
