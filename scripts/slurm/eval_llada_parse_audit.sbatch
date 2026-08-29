@@ -24,6 +24,10 @@ DIFFUSION_STEPS=${DIFFUSION_STEPS:-256}
 MAX_EXAMPLES=${MAX_EXAMPLES:-256}
 NUM_PROCESSES=${NUM_PROCESSES:-4}
 BATCH_SIZE=${BATCH_SIZE:-4}
+PROMPT_CHECKPOINT=${PROMPT_CHECKPOINT:-$ROOT/outputs/checkpoints/answer_prompt-gsm-seed42-steps300-unified-v1/checkpoint-300}
+CLAMP_CHECKPOINT=${CLAMP_CHECKPOINT:-$ROOT/outputs/checkpoints/answer_clamp-gsm-seed42-steps300-unified-v1/checkpoint-300}
+PROMPT_LABEL=${PROMPT_LABEL:-answer_prompt_step300}
+CLAMP_LABEL=${CLAMP_LABEL:-answer_clamp_step300}
 
 export PYTHONNOUSERSITE=1
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
@@ -58,15 +62,15 @@ case "${AUDIT_MODEL:-all}" in
     run_eval step0 ""
     ;;
   answer_prompt)
-    run_eval answer_prompt_step300 "$ROOT/outputs/checkpoints/answer_prompt-gsm-seed42-steps300-unified-v1/checkpoint-300"
+    run_eval "$PROMPT_LABEL" "$PROMPT_CHECKPOINT"
     ;;
   answer_clamp)
-    run_eval answer_clamp_step300 "$ROOT/outputs/checkpoints/answer_clamp-gsm-seed42-steps300-unified-v1/checkpoint-300"
+    run_eval "$CLAMP_LABEL" "$CLAMP_CHECKPOINT"
     ;;
   all)
     run_eval step0 ""
-    run_eval answer_prompt_step300 "$ROOT/outputs/checkpoints/answer_prompt-gsm-seed42-steps300-unified-v1/checkpoint-300"
-    run_eval answer_clamp_step300 "$ROOT/outputs/checkpoints/answer_clamp-gsm-seed42-steps300-unified-v1/checkpoint-300"
+    run_eval "$PROMPT_LABEL" "$PROMPT_CHECKPOINT"
+    run_eval "$CLAMP_LABEL" "$CLAMP_CHECKPOINT"
     ;;
   *) echo "Unknown AUDIT_MODEL=${AUDIT_MODEL}" >&2; exit 2 ;;
 esac
